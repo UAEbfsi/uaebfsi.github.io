@@ -1,0 +1,8 @@
+[{
+      "relation": ["delegate_permission/common.handle_all_urls"],
+      "target": {
+        "namespace": "android_app",
+        "package_name": "com.cnsme.spms.uae",
+        "sha256_cert_fingerprints": ["29:37:D5:9A:DE:E8:DF:82:3E:5D:1B:E0:CA:1E:D4:E7:DD:2C:BF:18:12:58:11:E5:8E:82:69:A4:22:1A:A8:48"]
+      }
+    }]
