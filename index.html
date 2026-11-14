@@ -11,7 +11,7 @@
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-title" content="SPMS UAE">
 <meta name="apple-mobile-web-app-status-bar-style" content="default">
-<meta name="spms-build" content="20261114112730">
+<meta name="spms-build" content="20261114165329">
 <link rel="preload" as="script" href="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js">
 <link rel="preload" as="script" href="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js">
 <link rel="preload" as="script" href="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js">
@@ -1039,9 +1039,8 @@ const FIX_REASONS = ['Wrong entry', 'Count difference', 'Other'];
 const DELIVERY = [['driver', 'By driver'], ['collect', 'Engineer collects'], ['courier', 'By courier']];
 /* how an engineer sends a part back: he brings it himself, a driver takes it, or a courier (with the receipt photo) */
 const RETURN_BY = [['self', 'Self return'], ['driver', 'By driver'], ['courier', 'By courier']];
-/* every driver task (deliveries and returns) goes to Faisal, so nobody types a driver name (11 Nov 2026) */
-const DRIVER_NAME = 'Faisal';
-const COURIER_COS = ['Nool', 'GTC', 'Other'];   /* Other: the user types the company name */
+/* By driver records no driver name: nobody types one and none is shown (14 Nov 2026) */
+const COURIER_COS = ['Aramex', 'DHL', 'Emirates Post', 'FedEx', 'Other'];   /* Other: the user types the company name */
 const isCollect = j => !!(j && j.dispatch && j.dispatch.delivery === 'collect');
 const APP_URL = FIREBASE_BUILD ? location.origin + location.pathname.replace(/index\.html$/, '') : 'https://uaebfsi.github.io/';   /* the link staff open; used in WhatsApp messages */
 const SESSION_KEY = 'spms-flow-session-v1', LAST_EMAIL = 'spms-last-email', LOCAL_KEY = 'spms-flow-local-v2', LEASE_KEY = 'spms-lease-v1';
@@ -2406,23 +2405,23 @@ function assignSns(taken, typed) {
   return out;
 }
 /* Stock says how each part goes (required): a driver takes it (driver name optional), the engineer collects it at Stock,
-   or a courier takes it (Nool, GTC or another company) with a photo of the courier receipt (required) */
+   or a courier takes it (Aramex, DHL, Emirates Post, FedEx or another company) with a photo of the courier receipt (required) */
 const DELIV_MSG = 'Choose the delivery method: by driver, the engineer collects it, or by courier.';
 const RCPT_MAX = 1;   /* one photo of the courier receipt */
 const oneLine = (v, n) => String(v || '').trim().replace(/\s+/g, ' ').slice(0, n || 60);
 function courierOf(d) {
-  const c = d && d.cco; if (!COURIER_COS.includes(c)) throw E('Choose the courier company: Nool, GTC or Other.');
+  const c = d && d.cco; if (!COURIER_COS.includes(c)) throw E('Choose the courier company: Aramex, DHL, Emirates Post, FedEx or Other.');
   const company = c === 'Other' ? oneLine(d.ccoName) : c; if (!company) throw E('Type the name of the courier company.');
   const receipt = ((d && d.rcpt) || []).filter(x => /^data:image\//.test(x)).slice(0, RCPT_MAX);
   if (!receipt.length) throw E('Add a photo of the courier receipt.');
   return { company, receipt };
 }
-/* who: the engineer it is for. By driver is always Faisal; when the engineer collects it himself, his own name is
+/* who: the engineer it is for. By driver records no driver name; when the engineer collects it himself, his own name is
    recorded as the collector. */
 function deliveryOf(d, who) {
   const v = d && d.deliv; if (!['driver', 'collect', 'courier'].includes(v)) throw E(DELIV_MSG);
   if (v === 'courier') { const c = courierOf(d); return { delivery: v, driver: '', company: c.company, receipt: c.receipt, courier: 'By courier · ' + c.company }; }
-  if (v === 'driver') return { delivery: v, driver: DRIVER_NAME, courier: 'By driver · ' + DRIVER_NAME };
+  if (v === 'driver') return { delivery: v, driver: '', courier: 'By driver' };
   const name = oneLine(who);
   return { delivery: v, driver: name, courier: name ? 'Collected by ' + name : 'Collected by the engineer' };
 }
@@ -2432,7 +2431,7 @@ const RETURN_MSG = 'Choose how the part goes back: self return, by driver, or by
 function returnVia(d, who) {
   const v = d && d.rvia; if (!['self', 'driver', 'courier'].includes(v)) throw E(RETURN_MSG);
   if (v === 'courier') { const c = courierOf(d); return { via: v, driver: '', company: c.company, receipt: c.receipt, courier: 'By courier · ' + c.company }; }
-  if (v === 'driver') return { via: v, driver: DRIVER_NAME, courier: 'By driver · ' + DRIVER_NAME };
+  if (v === 'driver') return { via: v, driver: '', courier: 'By driver' };
   const name = oneLine(who);   /* self return: the engineer's own name */
   return { via: v, driver: name, courier: name ? 'Self return · ' + name : 'Self return' };
 }
@@ -3648,17 +3647,17 @@ const box = inner => `<div class="card action">${inner}</div>`;
 const chargeField = d => fld('Chargeable case', segBtns(d, 'charge', [['', 'No'], ['1', 'Yes']]), d.charge === '1' ? 'The customer pays: not taken from the engineer’s budget.' : 'Choose Yes when the part was not needed because of the engineer’s work.');
 /* Stock chooses how the part goes (required): a driver takes it, the engineer collects it at Stock, or a courier */
 function deliveryField(d, who) {
-  const hint = d.deliv === 'collect' ? `${who || 'The engineer'} collects it from Stock and confirms in SPMS. Collector: ${who || 'the engineer'}.` : d.deliv === 'driver' ? `Driver: ${DRIVER_NAME}. He takes it to ${who || 'the engineer'}, who confirms in SPMS.` : d.deliv === 'courier' ? `A courier takes it to ${who || 'the engineer'}, who confirms in SPMS.` : 'Required: by driver, the engineer collects it, or by courier.';
+  const hint = d.deliv === 'collect' ? `${who || 'The engineer'} collects it from Stock and confirms in SPMS. Collector: ${who || 'the engineer'}.` : d.deliv === 'driver' ? `A driver takes it to ${who || 'the engineer'}, who confirms in SPMS.` : d.deliv === 'courier' ? `A courier takes it to ${who || 'the engineer'}, who confirms in SPMS.` : 'Required: by driver, the engineer collects it, or by courier.';
   return fld('Delivery method *', segBtns(d, 'deliv', DELIVERY), hint) + (d.deliv === 'courier' ? courierFields(d) : '');
 }
-/* by courier: the company (Nool, GTC or another one typed in) and a photo of the courier receipt (required) */
+/* by courier: the company (Aramex, DHL, Emirates Post, FedEx or another one typed in) and a photo of the courier receipt (required) */
 function courierFields(d) {
   return fld('Courier company *', segBtns(d, 'cco', COURIER_COS.map(c => [c, c])), d.cco ? '' : 'Required.') + (d.cco === 'Other' ? inp(d, 'ccoName', 'Courier company name *', 'Type the company name') : '')
     + photoField(d, 'rcpt', 'Photo of the courier receipt', true, { max: RCPT_MAX, need: 'A photo of the courier receipt is required.', ok: 'Stock and the Team Leader can see it.' });
 }
 /* the engineer chooses how a return goes back (required): self return, by driver, or by courier */
 function returnField(d) {
-  const me = ME(), hint = d.rvia === 'self' ? `You bring it to Stock yourself (recorded as ${me ? me.name : 'you'}).` : d.rvia === 'driver' ? `Driver: ${DRIVER_NAME}. He takes it to Stock.` : d.rvia === 'courier' ? 'A courier takes it to Stock.' : 'Required: self return, by driver, or by courier.';
+  const me = ME(), hint = d.rvia === 'self' ? `You bring it to Stock yourself (recorded as ${me ? me.name : 'you'}).` : d.rvia === 'driver' ? 'A driver takes it to Stock.' : d.rvia === 'courier' ? 'A courier takes it to Stock.' : 'Required: self return, by driver, or by courier.';
   return fld('How does it go back? *', segBtns(d, 'rvia', RETURN_BY), hint) + (d.rvia === 'courier' ? courierFields(d) : '');
 }
 /* hub picker: buttons for up to 3 hubs, a list beyond that */
