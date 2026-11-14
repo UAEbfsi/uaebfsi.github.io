@@ -11,7 +11,7 @@
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-title" content="SPMS UAE">
 <meta name="apple-mobile-web-app-status-bar-style" content="default">
-<meta name="spms-build" content="20261114102734">
+<meta name="spms-build" content="20261114112730">
 <link rel="preload" as="script" href="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js">
 <link rel="preload" as="script" href="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js">
 <link rel="preload" as="script" href="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js">
@@ -5926,7 +5926,9 @@ const BUILTIN_TL = [
 const builtinTL = email => BUILTIN_TL.find(t => t.email === String(email || '').trim().toLowerCase()) || null;
 /* the Operations Manager built into SPMS (firestore.rules and the sender carry the same list): read-only access to the
    dashboard and reports. He gets his password by email the same way as a built-in Team Leader. */
-const BUILTIN_MGR = [];
+const BUILTIN_MGR = [
+  { email: 'hany.khalifa@cns-me.com', name: 'Hany Khalifa', title: 'Regional Operations Manager', hub: 'DMH' }
+];
 const builtinMgr = email => BUILTIN_MGR.find(t => t.email === String(email || '').trim().toLowerCase()) || null;
 /* where the link in a password email brings people back to: this copy of SPMS */
 const mailLink = () => ({ url: location.origin + location.pathname.replace(/index\.html$/, '') });
