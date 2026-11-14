@@ -11,7 +11,7 @@
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-title" content="SPMS UAE">
 <meta name="apple-mobile-web-app-status-bar-style" content="default">
-<meta name="spms-build" content="20261112192244">
+<meta name="spms-build" content="20261114102734">
 <link rel="preload" as="script" href="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js">
 <link rel="preload" as="script" href="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js">
 <link rel="preload" as="script" href="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js">
@@ -982,13 +982,13 @@ let USERS = [];   /* Firebase build: everyone in the users collection, active or
 const idFromEmail = e => String(e || '').trim().toLowerCase().split('@')[0].replace(/[^a-z0-9.]/g, '');
 const ROLE = { TECH: 'Engineer', TL: 'Team Leader', STOCK: 'Stock', WS: 'Workshop', DRIVER: 'Driver', MGR: 'Operations Manager' };
 /* the Technical Manager approves the requests Stock sends him (built in; also in the Sender) */
-const TECH_MANAGERS = ['uaebfsi@gmail.com'], TM_NAME = 'Technical Manager';
+const TECH_MANAGERS = ['mohamed.said@cns-me.com'], TM_NAME = 'Technical Manager';
 const isTM = me => !!me && TECH_MANAGERS.includes(String(me.email || '').toLowerCase());
 /* what the person is called on screen: the full-access manager (Mohamed Said) shows his title, "Technical Manager - BFSI" */
 const roleName = me => me && me.full && me.role === me.baseRole ? (me.title || SAID_TITLE) : (me ? ROLE[me.role] || '' : '');
 /* Mohamed Said's built-in, locked account (role Team Leader). His title is always "Technical Manager - BFSI", whatever
    his staff record says (nobody can edit that record from the app) */
-const SAID_EMAIL = 'uaebfsi@gmail.com', SAID_TITLE = 'Technical Manager - BFSI';
+const SAID_EMAIL = 'mohamed.said@cns-me.com', SAID_TITLE = 'Technical Manager - BFSI';
 const fixTitle = u => { if (u && String(u.email || u.id || '').toLowerCase() === SAID_EMAIL) u.title = SAID_TITLE; return u; };
 const TEST_PW = 'Test#2026';
 const RETURN_HOURS = 48, DEFAULT_RATE = 5, PAGE = 300;
@@ -5921,7 +5921,7 @@ async function fbSecondaryAuth() {
    page), sign in, and add everyone else. Mohamed Said is shown as Team Leader and has full access: he can work as
    any role, in every hub. */
 const BUILTIN_TL = [
-  { email: 'uaebfsi@gmail.com', name: 'Mohamed Said', title: 'Technical Manager - BFSI', hub: 'DMH', full: true }
+  { email: 'mohamed.said@cns-me.com', name: 'Mohamed Said', title: 'Technical Manager - BFSI', hub: 'DMH', full: true }
 ];
 const builtinTL = email => BUILTIN_TL.find(t => t.email === String(email || '').trim().toLowerCase()) || null;
 /* the Operations Manager built into SPMS (firestore.rules and the sender carry the same list): read-only access to the
@@ -6188,7 +6188,7 @@ SH.accounts = d => {
   if (d.mode === 'list') {
     const q = (d.aq || '').trim().toLowerCase();
     const list = USERS.filter(u => !q || [u.name, u.email, ROLE[u.role], u.hub].join(' ').toLowerCase().includes(q)).sort((a, b) => ((a.active === false) - (b.active === false)) || (ROLE_ORDER[a.role] - ROLE_ORDER[b.role]) || String(a.name).localeCompare(b.name));
-    const SAID = 'uaebfsi@gmail.com', selOn = !!d.selOn, sel = d.selIds || (d.selIds = {});
+    const SAID = 'mohamed.said@cns-me.com', selOn = !!d.selOn, sel = d.selIds || (d.selIds = {});
     if (selOn && !d.selAct) d.selAct = 'pw';
     const toPw = selOn && d.selAct === 'pw';
     /* who can be ticked: anyone but Mohamed Said; for a password email only people with an email address and access */

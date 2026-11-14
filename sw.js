@@ -1,5 +1,5 @@
 /* SPMS offline support: the app opens even with a weak signal. Saving still needs the internet; the app says so. */
-const V = 'spms-20261112192244', NET_WAIT = 3000;
+const V = 'spms-20261114102734', NET_WAIT = 3000;
 const SHELL = ['./', 'index.html', 'firebase-config.js', 'manifest.webmanifest', 'icons/icon-192.png', 'icons/icon-512.png', 'icons/apple-touch-icon.png', 'icons/favicon-64.png'];
 self.addEventListener('install', e => {
   e.waitUntil(caches.open(V).then(c => Promise.all(SHELL.map(u => c.add(new Request(u, { cache: 'reload' })).catch(() => {})))).then(() => self.skipWaiting()));
