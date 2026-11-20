@@ -16,4 +16,4 @@ window.FIREBASE_VAPID_KEY = "BKaew9WuXm50x-2dfKlmsSzW9ubBRyLxyukXaP0UlcLEhROsPU3
 
 /* The free notification sender (Google Apps Script): after you deploy it as a Web app, paste its Web app URL here.
    Leave it as it is if you use the Firebase server function (Blaze plan) instead. */
-window.SPMS_PUSH_URL = "PASTE_SENDER_URL";
+window.SPMS_PUSH_URL = "https://script.google.com/macros/s/AKfycbzrJZVzkUR5p2HIo_U_ptEZTZkl0aAKUPUDRjgAOlcj95lvygV5OfFuTJWCTab7z8jaVQ/exec";
