@@ -11,7 +11,7 @@
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-title" content="SPMS UAE">
 <meta name="apple-mobile-web-app-status-bar-style" content="default">
-<meta name="spms-build" content="20261120175945">
+<meta name="spms-build" content="20261124171920">
 <link rel="preload" as="script" href="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js">
 <link rel="preload" as="script" href="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js">
 <link rel="preload" as="script" href="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js">
@@ -1112,6 +1112,9 @@ const ST = {
   REPAIRED: { label: 'Repaired · back to Stock', tone: 'ok', who: 'STOCK', next: 'Confirm back in stock' },
   /* a customer's part the Workshop repaired (or could not repair): Stock sends it back to the customer (16 Nov 2026) */
   TO_CUST: { label: 'Back to Stock · to send to the customer', tone: 'ok', who: 'STOCK', next: 'Send to the customer' },
+  /* a chargeable case with no part (22 Nov 2026, e.g. a SW reload): after the Team Leader approves, the Service
+     Coordinator confirms he received it and it closes */
+  SC_CONF: { label: 'Approved · waiting for the Service Coordinator', tone: 'info', who: 'SC', next: 'Confirm receipt' },
   CLOSED: { label: 'Closed', tone: 'ok', who: null, next: '' },
   REJECTED: { label: 'Rejected', tone: 'bad', who: null, next: '' },
   CANCELLED: { label: 'Cancelled', tone: '', who: null, next: '' }
@@ -1133,7 +1136,9 @@ const VAN_ST = { TL: { label: 'Van part use · waiting for Team Leader', next: '
 const XFER_ST = { REPL_CONF: { label: 'On the way to the hub', next: 'Confirm the parts arrived at your hub' }, CLOSED: { label: 'Received at the hub', next: '' } };
 /* a part the Workshop added to repair (16 Nov 2026, e.g. from a scrapped machine): the Team Leader approves it first */
 const WSADD_ST = { TL: { label: 'Workshop part · waiting for Team Leader', next: 'Approve or reject' }, WORKSHOP: { label: 'Approved · ready to repair', next: 'Accept the part' } };
-const TYPE_ST = { rep: REP_ST, ret: RET_ST, van: VAN_ST, xfer: XFER_ST, wsadd: WSADD_ST };
+/* a chargeable case with no part (type 'svc', 22 Nov 2026): Team Leader, then Service Coordinator, then closed */
+const SVC_ST = { TL: { label: 'Chargeable case · waiting for Team Leader', next: 'Approve or reject' }, SC_CONF: { label: 'Approved · waiting for the Service Coordinator', next: 'Confirm receipt' }, CLOSED: { label: 'Closed · received by the Service Coordinator', next: '' } };
+const TYPE_ST = { rep: REP_ST, ret: RET_ST, van: VAN_ST, xfer: XFER_ST, wsadd: WSADD_ST, svc: SVC_ST };
 const stType = j => j.xfer ? 'xfer' : j.type;
 /* the part waits at Stock for the engineer to collect it (instead of a driver bringing it) */
 const COLLECT_ST = {
@@ -1288,6 +1293,120 @@ const segBtns = (d, k, opts) => `<div class="seg" role="group">${opts.map(([v, l
 const stepper = (d, k, min, max, label) => `<div class="stepper" role="group" aria-label="${esc(label || 'Quantity')}"><button type="button" data-a="stepMax" data-k="${k}" data-delta="-1" data-min="${min}" data-max="${max}" aria-label="Less"${+d[k] <= min ? ' disabled' : ''}>−</button><output class="num">${esc(d[k])}</output><button type="button" data-a="stepMax" data-k="${k}" data-delta="1" data-min="${min}" data-max="${max}" aria-label="More"${+d[k] >= max ? ' disabled' : ''}>+</button></div>`;
 const emptyBox = (t, s) => `<div class="list"><div class="empty"><div class="em-ic">${ic('check')}</div><b style="display:block;color:var(--ink);font-size:16px;margin-bottom:4px">${esc(t)}</b>${esc(s || '')}</div></div>`;
 const searchBox = (id, key, ph, val) => `<div class="searchbox">${ic('search')}<input class="inp" id="${id}" placeholder="${esc(ph)}" data-q="${key}" value="${esc(val || '')}" autocomplete="off" aria-label="${esc(ph)}"></div>`;
+/* SLA (20 Nov 2026): how many working days each step may take, and where a request stands against it. The app and the
+   Sender (its hourly run) use this same file, so the red "SLA breached" tag, the SLA report and the emails always agree.
+   - Working days are Monday to Friday (Saturday and Sunday are the weekend), less the public holidays the Workshop
+     Team Leader keeps in Workshop performance (settings/wsperf.holidays).
+   - A step's clock starts when the request reached it (the handover in SPMS). The step is due by the end of the Nth
+     working day after that day; 0 means the same working day. Days are set in Database → SLA (settings/sla.days).
+   - Send the part back (replaced, arrived faulty or not used) has no SLA: it keeps its own Return deadline and
+     overdue email, as before (Mohamed, 21 Nov 2026).
+   - Reminder on the due day; "SLA breached" from the first working day after it; escalated to the Technical Manager
+     2 working days after the breach.
+   - A hold the Team Leader approved stops the clock. When the hold ends, the step gets its full days again from then.
+   - The Workshop has one step only: receiving the part for repair. */
+const SLA_STEPS = [
+  { k: 'tl', label: 'Approve the request', who: 'Team Leader', kind: 'urg', def: [1, 0] },
+  { k: 'tlx', label: 'Approve van part use or a Workshop part', who: 'Team Leader', kind: 'one', def: [1] },
+  { k: 'tm', label: 'Technical Manager approval', who: 'Technical Manager', kind: 'one', def: [1] },
+  { k: 'stock', label: 'Pick and dispatch', who: 'Stock', kind: 'urg', def: [1, 0] },
+  { k: 'drv', label: 'Hand the part to the courier', who: 'Driver', kind: 'one', def: [1] },
+  { k: 'rcv', label: 'Confirm receipt', who: 'Engineer', kind: 'hub', def: [1, 4] },
+  { k: 'act', label: 'Record the action taken', who: 'Engineer', kind: 'one', def: [3] },
+  { k: 'rret', label: 'Confirm the return received', who: 'Stock', kind: 'hub', def: [1, 3] },
+  { k: 'route', label: 'Decide: Workshop, scrap or stock', who: 'Stock', kind: 'one', def: [1] },
+  { k: 'ws', label: 'Receive the part for repair', who: 'Workshop', kind: 'one', def: [1] },
+  { k: 'back', label: 'Put the repaired part back in stock', who: 'Stock', kind: 'one', def: [1] },
+  { k: 'cust', label: 'Send the customer part', who: 'Stock', kind: 'one', def: [2] },
+  { k: 'repl', label: 'Send the hub refill', who: 'Stock', kind: 'one', def: [2] },
+  { k: 'replc', label: 'Confirm the parts arrived at the hub', who: 'Engineer', kind: 'one', def: [4] }
+];
+/* who must act on each step (the roles in SPMS) */
+const SLA_WHO = { tl: 'TL', tlx: 'TL', tm: 'TM', stock: 'STOCK', drv: 'DRIVER', rcv: 'TECH', act: 'TECH', rret: 'STOCK', route: 'STOCK', ws: 'WS', back: 'STOCK', cust: 'STOCK', repl: 'STOCK', replc: 'TECH' };
+const SLA_MAX = 30, SLA_ESC_DAYS = 2;
+const slaStep = k => SLA_STEPS.find(s => s.k === k) || null;
+/* the days of every step: what the Team Leader saved, else the defaults */
+function slaDays(cfg) {
+  const d = (cfg && cfg.days) || {}, out = {};
+  for (const s of SLA_STEPS) {
+    if (!s.def) continue;
+    const v = Array.isArray(d[s.k]) ? d[s.k] : [];
+    out[s.k] = s.def.map((x, i) => { const n = parseInt(v[i], 10); return n >= 0 && n <= SLA_MAX ? n : x; });
+  }
+  return out;
+}
+/* the step a request is at (by its status); '' when that step has no SLA (the return to Stock, the repair itself) */
+function slaKey(j) {
+  if (!j || !j.status) return '';
+  switch (j.status) {
+    case 'TL': return j.type === 'van' || j.type === 'wsadd' ? 'tlx' : 'tl';
+    case 'TM': return 'tm';
+    case 'STOCK': return 'stock';
+    case 'DRV_PICK': case 'DRV_GO': case 'DRV_COUR': case 'DRV_RET_PICK': case 'DRV_RET_GO': case 'REPL_GO': return 'drv';
+    case 'DISPATCHED': case 'USE_OK': return 'rcv';
+    case 'RECEIVED': case 'VAN_OK': return 'act';
+    case 'RETURNING': return 'rret';
+    case 'ATHUB': return 'route';
+    case 'WORKSHOP': return j.type === 'wsadd' ? '' : 'ws';   /* a part the Workshop added itself: nothing to receive */
+    case 'REPAIRED': return 'back';
+    case 'TO_CUST': return 'cust';
+    case 'REPL': return 'repl';
+    case 'REPL_CONF': return 'replc';
+  }
+  return '';
+}
+/* dates are 'YYYY-MM-DD' in UAE time (UTC+4) */
+const slaYmd = t => { const d = new Date(+t + 4 * 3600000); return d.getUTCFullYear() + '-' + ('0' + (d.getUTCMonth() + 1)).slice(-2) + '-' + ('0' + d.getUTCDate()).slice(-2); };
+const slaNext = ymd => { const d = new Date(ymd + 'T00:00:00Z'); d.setUTCDate(d.getUTCDate() + 1); return d.toISOString().slice(0, 10); };
+/* the public holidays: a test for one day */
+function slaHol(list) {
+  const L = (Array.isArray(list) ? list : []).filter(x => x && x.from).map(x => [String(x.from), String(x.to || x.from)]);
+  return ymd => L.some(x => x[0] <= ymd && ymd <= x[1]);
+}
+function slaWork(ymd, hol) { const w = new Date(ymd + 'T00:00:00Z').getUTCDay(); return w !== 6 && w !== 0 && !(hol && hol(ymd)); }
+/* the day itself when it is a working day, else the next working day */
+function slaOnOrAfter(ymd, hol) { let d = ymd, i = 0; while (!slaWork(d, hol) && i++ < 400) d = slaNext(d); return d; }
+/* the Nth working day after a day (0: that day, or the next working day) */
+function slaAdd(ymd, n, hol) {
+  if (!(n > 0)) return slaOnOrAfter(ymd, hol);
+  let d = ymd, i = 0, k = 0;
+  while (i < n && k++ < 2000) { d = slaNext(d); if (slaWork(d, hol)) i++; }
+  return d;
+}
+/* the working days after a and up to b */
+function slaCount(a, b, hol) { let d = a, n = 0, k = 0; while (d < b && k++ < 2000) { d = slaNext(d); if (slaWork(d, hol)) n++; } return n; }
+/* when the clock of the current step started: the handover (sla.at), or the end of a hold (sla.from). A request saved
+   before 20 Nov 2026 has no record: its last history line, else its last change. A part for repair waits for the
+   morning batch: its clock starts at the batch. */
+function slaStart(j) {
+  const s = j.sla;
+  let t = s && s.st === j.status ? +(s.from || s.at) || 0 : 0;
+  if (!t) { const h = Array.isArray(j.history) && j.history.length ? j.history[j.history.length - 1] : null; t = (h && +h.at) || +j.updatedAt || +j.createdAt || 0; }
+  if (j.status === 'WORKSHOP' && j.ret && +j.ret.wsAt > t) t = +j.ret.wsAt;
+  return t;
+}
+/* the hold on the current step: { at, by, byId, role, reason, ok: { at, by } once the Team Leader approved it } */
+const slaHold = j => j && j.sla && j.sla.st === j.status && j.sla.hold && j.sla.hold.reason ? j.sla.hold : null;
+/* where a request stands now. c = { cfg | days, hol, hub (the hub that sets the days), now }.
+   stage: ok (in time), due (due today), late (SLA breached), esc (escalated), hold (on hold). null: no SLA step. */
+function slaState(j, c) {
+  const k = slaKey(j); if (!k) return null;
+  const step = slaStep(k), now = +c.now || Date.now(), today = slaYmd(now), hol = c.hol || null;
+  const days = c.days || slaDays(c.cfg);
+  const start = slaStart(j);
+  const v = days[k] || step.def;
+  const n = step.kind === 'hub' ? (c.hub === 'DMH' ? v[0] : v[1]) : step.kind === 'urg' ? (j.urgency === 'urgent' ? v[1] : v[0]) : v[0];
+  const due = slaAdd(slaYmd(start), n, hol);
+  const hold = slaHold(j), breach = slaAdd(due, 1, hol), esc = slaAdd(breach, SLA_ESC_DAYS, hol);
+  let stage = 'ok', late = 0;
+  if (hold && hold.ok) stage = 'hold';
+  else if (today === due) stage = 'due';
+  else if (today > due) { stage = today >= esc ? 'esc' : 'late'; late = Math.max(1, slaCount(due, today, hol)); }
+  return { k, step, who: SLA_WHO[k], start, days: n, due, breach, esc, stage, late, hold };
+}
+const slaIsLate = x => !!x && (x.stage === 'late' || x.stage === 'esc');
+/* a day for people: "Mon 23 Nov" */
+const slaDay = ymd => { if (!ymd) return ''; const d = new Date(ymd + 'T00:00:00Z'); return ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'][d.getUTCDay()] + ' ' + d.getUTCDate() + ' ' + ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'][d.getUTCMonth()]; };
 /* ==========================================================================
    Storage: one interface over the device-only store, the shared Claude store and Firebase
    sub(col, query, cb) · get · query · set · update · del · acquire/release (save locks)
@@ -1652,6 +1771,7 @@ function subscribeAll() {
     const hb = list.find(x => x.id === 'hubs'); setHubs(hb && hb.list); DATAV.inv++;
     setReturnDays(list.find(x => x.id === 'returns'));
     setWsPerf(list.find(x => x.id === 'wsperf'));
+    setSla(list.find(x => x.id === 'sla'));   /* SLA days and messages on/off (20 Nov 2026) */
     const p = list.find(x => x.id === 'policy'); POLICY = { autoMaxValue: p && +p.autoMaxValue >= 0 ? +p.autoMaxValue : 100, autoMaxQty: p && +p.autoMaxQty >= 0 ? +p.autoMaxQty : 5 };
     ready.settings = true; DATAV.set++; afterLoad();
   });
@@ -1697,7 +1817,7 @@ function mergeJobs() {
   for (const j of (ARCHIVE || [])) m.set(j.id, j);
   for (const j of JOBS_RECENT) m.set(j.id, j);
   for (const j of JOBS_OPEN) m.set(j.id, j);
-  const list = [...m.values()].filter(j => j.status && j.pn).map(normJob).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+  const list = [...m.values()].filter(j => j.status && (j.pn || j.type === 'svc')).map(normJob).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
   notifyChanges(list); JOBS = list; DATAV.jobs++; afterLoad();
 }
 function notifyChanges(list) {
@@ -2215,12 +2335,12 @@ function nextDoc(j, me, status, action, note, extra) {
   if (!isOpenStatus(status) && !doc.closedAt) doc.closedAt = now;
   return doc;
 }
-async function saveJob(doc) { undoMark(doc); UI.lastWrite[doc.id] = doc.updatedAt; await api.set('jobs', doc.id, doc); upsertJob(doc); return doc; }
+async function saveJob(doc) { slaStamp(doc); undoMark(doc); UI.lastWrite[doc.id] = doc.updatedAt; await api.set('jobs', doc.id, doc); upsertJob(doc); return doc; }
 function upsertJob(doc) {
   const d = normJob(Object.assign({}, doc)); const put = arr => { const i = arr.findIndex(x => x.id === d.id); if (i >= 0) arr[i] = d; else arr.unshift(d); return arr; };
   JOBS_RECENT = put(JOBS_RECENT.slice()); JOBS_OPEN = d.open ? put(JOBS_OPEN.slice()) : JOBS_OPEN.filter(x => x.id !== d.id); mergeJobs();
 }
-const cleanCopy = j => { const c = Object.assign({}, j); for (const k of ['id', 'history', 'backorders', 'splits', 'reminders', 'ws', 'closedAt', 'outcome', 'reqPhotos', 'rcvPhotos', 'undo']) delete c[k]; return c; };
+const cleanCopy = j => { const c = Object.assign({}, j); for (const k of ['id', 'history', 'backorders', 'splits', 'reminders', 'ws', 'closedAt', 'outcome', 'reqPhotos', 'rcvPhotos', 'undo', 'sla', 'slaLog', 'slaMark']) delete c[k]; return c; };
 
 async function createJob(d, dry) {
   const me = mustRole('TECH');
@@ -2290,12 +2410,17 @@ async function vanAddMany(rows, fileName) {
 }
 async function techCancel(id, d) {
   return jobStep(id, ['TL', 'STOCK', 'USE_OK', 'VAN_OK'], 'TECH', async (j, me) => {
-    if (!['req', 'van'].includes(j.type)) throw E('Only part requests can be cancelled.');
+    if (!['req', 'van', 'svc'].includes(j.type)) throw E('Only part requests can be cancelled.');
     const note = (d.cnote || '').trim();
     return saveJob(nextDoc(j, me, 'CANCELLED', 'Cancelled by engineer', note, { outcome: 'Cancelled by engineer' }));
   });
 }
 function checkTl(j, d) {
+  if (isSvc(j)) {   /* a chargeable case with no part: approve as it is, or reject with a reason */
+    if (d.mode !== 'reject') return null;
+    if (!(d.remarks || '').trim()) throw E('Write why you are rejecting it.');
+    return `Reject this chargeable case (${j.work || 'no part'} on ${j.scn})? The engineer sees your reason.`;
+  }
   if (j.type === 'wsadd') {   /* a part the Workshop added: approve as it is, or reject with a reason */
     if (d.mode !== 'reject') return null;
     if (!(d.remarks || '').trim()) throw E('Write why you are rejecting it.');
@@ -2317,6 +2442,10 @@ function chargeAt(j, d, me, now) {
 async function tlDecide(id, d) {
   return jobStep(id, 'TL', 'TL', async (j, me) => {
     checkTl(j, d); let note = (d.remarks || '').trim(); const now = Date.now();
+    if (isSvc(j)) {   /* a chargeable case with no part: approved, it goes to the Service Coordinator (22 Nov 2026) */
+      if (d.mode === 'reject') return saveJob(nextDoc(j, me, 'REJECTED', 'Rejected by Team Leader', note, { tl: { by: me.name, at: now, note, rejected: true }, outcome: 'Rejected' }));
+      return saveJob(nextDoc(j, me, 'SC_CONF', 'Approved by Team Leader', note, { tl: { by: me.name, at: now, note } }));
+    }
     if (j.type === 'wsadd') {   /* approved: the Workshop accepts it and repairs it like any other part */
       if (d.mode === 'reject') return saveJob(nextDoc(j, me, 'REJECTED', 'Rejected by Team Leader', note, { tl: { by: me.name, at: now, note, rejected: true }, outcome: 'Rejected' }));
       return saveJob(nextDoc(j, me, 'WORKSHOP', 'Approved by Team Leader', note, { qtyApproved: j.qty, tl: { by: me.name, at: now, note } }));
@@ -2737,6 +2866,54 @@ function dnOf(d) {
   return p;
 }
 const noReturnOf = (j, d) => ccReturn(j) && d && d.ccto === 'none';
+/* ---------- chargeable case with no part (22 Nov 2026) ----------
+   Work the customer pays for without a spare part, e.g. a software reload. The engineer picks the machine and the work
+   (SW reload or Other), writes the details and the service call number, and adds one photo of the SAR signed by the
+   customer. It never passes Stock and is not taken from his budget: the Team Leader approves or rejects it, then the
+   Service Coordinator confirms he received it and it closes. It is in the Cash charge tab and its Excel. */
+const SVC_WORK = ['SW reload', 'Other'];
+const SAR_MAX = 1;   /* one photo of the signed SAR */
+const SAR_MSG = 'Add a photo of the SAR signed by the customer.';
+const isSvc = j => !!j && j.type === 'svc';
+/* on the Cash charge tab: approved by the Team Leader (waiting for the Service Coordinator, or confirmed) */
+const svcCase = j => isSvc(j) && ['SC_CONF', 'CLOSED'].includes(j.status);
+function sarOf(d) {
+  const p = ((d && d.sar) || []).filter(x => /^data:image\//.test(x)).slice(0, SAR_MAX);
+  if (!p.length) throw E(SAR_MSG);
+  return p;
+}
+function checkSvc(d) {
+  d = d || {};
+  const work = SVC_WORK.includes(d.work) ? d.work : ''; if (!work) throw E('Pick the work: SW reload or Other.');
+  const details = String(d.details || '').trim(); if (!details) throw E(work === 'Other' ? 'Write what work you did.' : 'Write the details of the SW reload.');
+  const scn = String(d.scn || '').trim().toUpperCase(); if (!scn) throw E('Enter the Service Call Number.');
+  const machine = String(d.machine || '').trim().toUpperCase(); if (!machine) throw E('Enter the machine ID.');
+  const sar = sarOf(d), me = ME();
+  const dup = me && JOBS.find(x => isSvc(x) && x.techId === me.id && (x.scn || '') === scn && ['TL', 'SC_CONF'].includes(x.status));
+  if (dup) throw E(`You already have an open chargeable case on ${scn} (${dup.id}).`);
+  return { work, details, scn, machine, sar };
+}
+async function createSvc(d) {
+  const me = mustRole('TECH'), c = checkSvc(d);   /* checkSvc also refuses a second open case on the same service call */
+  const now = Date.now(), id = newId('CHG'), m = findMachine(c.machine) || {};
+  const job = { id, type: 'svc', pn: '', desc: c.work, work: c.work, details: c.details, scn: c.scn, machine: c.machine, machineSn: m.sn || '', model: String(d.model || '').trim(), customer: String(d.customer || '').trim(), contract: String(d.contract || '').trim(), site: String(d.site || '').trim(),
+    chargeable: true, sar: c.sar, urgency: 'normal', note: '', techId: me.id, techName: me.name, hub: myHub(), status: 'TL', open: true, createdAt: now, updatedAt: now, updatedBy: me.name,
+    history: [{ at: now, by: me.name, role: ROLE.TECH, action: 'Chargeable case · no part', note: `${c.work} on ${c.scn} · ${c.machine} · SAR photo added` }] };
+  await saveJob(job); return id;
+}
+/* the Service Coordinator confirms he received the case: it closes. Like jobStep, but without a lock (he is read only
+   everywhere else): the security rules let him close it only while it waits for him, so a second confirmation fails. */
+async function scConfirm(id, d) {
+  must(JOB(id), 'SC_CONF', 'SC');
+  const j = await api.get('jobs', id); if (!j) throw E('This request no longer exists.');
+  const me = must(normJob(j), 'SC_CONF', 'SC');
+  if (!isSvc(j)) throw E('Only a chargeable case with no part is confirmed here.');
+  const outer = REC; REC = { key: rid('U'), id, base: JSON.parse(JSON.stringify(j)), puts: [], takes: [], made: [], main: null, entry: null, n: 0 };
+  try {
+    const note = String((d && d.scnote) || '').trim(), now = Date.now();
+    return await saveJob(nextDoc(j, me, 'CLOSED', 'Received by Service Coordinator', note, { sc: { by: me.name, byId: me.id || '', at: now, note }, outcome: 'Received by Service Coordinator' }));
+  } finally { REC = outer; }
+}
 async function techShip(id, d) {
   return jobStep(id, 'RETURN', 'TECH', async (j, me) => {
     const cc = ccReturn(j), dn = cc ? dnOf(d) : null, now = Date.now();
@@ -3552,7 +3729,7 @@ const TABS = {
 /* an engineer at a regional hub has no van: his "My van" tab is "My hub", the stock on his hub's shelf */
 const noVanMe = me => !!me && me.role === 'TECH' && !hasVan(me.id);
 const tabsFor = me => noVanMe(me) ? TABS.TECH.map(t => t[0] === 'van' ? ['van', 'My hub', 'hub'] : t) : isWsLead(me) ? TABS.WS.concat([['rep', 'Reports', 'chart']]) : TABS[me.role];
-const quickFor = me => noVanMe(me) ? [['sheet', 'new', 'plus', 'New request', 1], ['tab', 'van', 'hub', 'My hub'], ['tab', 'all', 'list', 'My requests']] : QUICK[me.role] || [];
+const quickFor = me => noVanMe(me) ? [['sheet', 'new', 'plus', 'New request', 1], SVC_QA, ['tab', 'van', 'hub', 'My hub'], ['tab', 'all', 'list', 'My requests']] : QUICK[me.role] || [];
 /* the Workshop sees parts sent for repair only from 08:00 on the next working day (the morning batch) */
 function myJobs(me) { return me.role === 'TECH' ? JOBS.filter(j => j.techId === me.id) : me.role === 'WS' ? JOBS.filter(j => wsSees(j, me)) : JOBS; }
 /* the Workshop sees the parts sent to it (from the morning batch on), the repairs it accepted, and the parts it added
@@ -3591,6 +3768,7 @@ function putFocus(f) {
 
 /* ---------- main render ---------- */
 function render() {
+  queueBack();   /* the phone's Back button follows the tab (70-boot.js) */
   if (UI.fbMode && !UI.authReady) { $('#app').classList.add('out'); $('#bar').hidden = true; $('#tabs').hidden = true; $('#scr').innerHTML = `<div class="splash"><span class="logo">${LOGO}</span><b>Loading SPMS…</b></div>`; return; }
   if (UI.shared === 'none') { if (!$('#off-card')) renderOffline(); return; }
   const me = ME();
@@ -3670,8 +3848,10 @@ function homeCard(me, n) {
     <div class="h-row"><button class="h-pill" data-a="filter" data-v="open"><b>${open}</b>${me.role === 'WS' ? 'in workshop' : 'open'}</button><button class="h-pill" data-a="filter" data-v="closed"><b>${done}</b>${me.role === 'WS' ? 'repaired' : 'completed'}</button></div></section>`;
 }
 /* round shortcuts under the home card: [action, value, icon, label, primary] */
+/* a chargeable case with no part, e.g. a SW reload (22 Nov 2026) */
+const SVC_QA = ['sheet', 'svc', 'wallet', 'Chargeable · no part'];
 const QUICK = {
-  TECH: [['sheet', 'new', 'plus', 'New request', 1], ['sheet', 'vanuse', 'wrench', 'Use from van'], ['tab', 'van', 'van', 'My van'], ['tab', 'all', 'list', 'My requests']],
+  TECH: [['sheet', 'new', 'plus', 'New request', 1], ['sheet', 'vanuse', 'wrench', 'Use from van'], SVC_QA, ['tab', 'van', 'van', 'My van'], ['tab', 'all', 'list', 'My requests']],
   TL: [['goReport', 'dash', 'chart', 'Dashboard'], ['goReport', 'returns', 'ret', 'Returns'], ['goReport', 'stock', 'box', 'Stock levels'], ['excel', '', 'download', 'Excel']],
   STOCK: [['sheet', 'receive', 'plus', 'Receive', 1], ['sheet', 'import', 'sheet', 'Import Excel'], ['sheet', 'sendvan', 'send', 'Send to van'], ['sheet', 'sendhub', 'hub', 'Send to a hub'], ['tab', 'inv', 'search', 'Find stock']],
   WS: [['sheet', 'wsadd', 'plus', 'Add part to repair', 1]]   /* a part that did not come from a return, e.g. from a scrapped machine (16 Nov 2026) */
@@ -3695,6 +3875,7 @@ function steps(j) {
   if (j.type === 'hubrep' && j.xfer) return [['Sent by the Dubai Main Hub', true], ['Arrived at ' + (HUB_NAME[j.to] || j.to), j.status === 'CLOSED']];
   if (j.type === 'hubrep') return [['Refill raised', true], ['Sent by the Dubai Main Hub', !!j.dispatch]].concat(dc, [['Arrived at ' + (HUB_NAME[j.to] || j.to), j.status === 'CLOSED']]);
   if (j.type === 'ret') return [['Sent back by the engineer', true], ['Received at ' + (HUB_NAME[j.hub] || j.hub), j.status === 'CLOSED']];
+  if (isSvc(j)) return [['Chargeable case sent', true], ['Team Leader approved', !!j.tl && !j.tl.rejected], ['Received by the Service Coordinator', j.status === 'CLOSED' && !!j.sc]];
   if (isCustPart(j)) return [['Added by the Workshop', true], ['Workshop repair done', !!w.doneAt], ['Sent to the customer', j.status === 'CLOSED' && !!j.toCust]];
   if (j.type === 'wsadd') return [['Added by the Workshop', true], ['Team Leader approved', !!j.tl && !j.tl.rejected], ['Workshop accepted', !!w.inAt], ['Repaired', w.outcome === 'Repaired'], ['Closed', j.status === 'CLOSED']];
   const tail = r.noReturn ? [['No return · left with the customer', true], ['Closed', j.status === 'CLOSED']]   /* cash charge: the part stayed on site (17 Nov 2026) */
@@ -3722,7 +3903,8 @@ function kindPills(j) {
   if (j.type === 'hubrep') s += `<span class="pill">${j.xfer ? 'Hub transfer' : 'Hub refill'} · ${esc(j.to || '')}</span>`;
   if (j.type === 'ret') s += `<span class="pill">Return · ${esc(isVan(j.from) ? 'van' : j.from || '')}</span>`;
   if (j.type === 'wsadd') s += isCustPart(j) ? '<span class="pill">Customer part</span>' : '<span class="pill">Workshop part</span>';
-  if (j.chargeable) s += '<span class="pill">Chargeable</span>';
+  if (isSvc(j)) s += '<span class="pill">Chargeable · no part</span>';   /* 22 Nov 2026 */
+  else if (j.chargeable) s += '<span class="pill">Chargeable</span>';
   if (fromHub(j)) s += `<span class="pill">From ${esc(j.hub)} stock</span>`;
   if (j.backorder) s += '<span class="pill">Back-order</span>';
   if (j.split) s += '<span class="pill">Separate return</span>';
@@ -3734,7 +3916,7 @@ function jobMeta(j, me) {
   return `${me.role !== 'TECH' ? esc(j.techName) + ' · ' : ''}<span class="mono">${esc(j.scn)}</span> · ${esc(j.machine)}${j.customer ? ' · ' + esc(j.customer) : ''}`;
 }
 /* one icon per step, so a list can be read at a glance */
-const ST_IC = { TL: 'check', STOCK: 'box', VAN_OK: 'van', DISPATCHED: 'truck', DRV_COUR: 'truck', RECEIVED: 'wrench', RETURN: 'ret', RETURNING: 'truck', ATHUB: 'hub', WORKSHOP: 'wrench', REPAIRING: 'gear', REPAIRED: 'check', TO_CUST: 'truck', CLOSED: 'check', REJECTED: 'ban', CANCELLED: 'ban' };
+const ST_IC = { SC_CONF: 'wallet', TL: 'check', STOCK: 'box', VAN_OK: 'van', DISPATCHED: 'truck', DRV_COUR: 'truck', RECEIVED: 'wrench', RETURN: 'ret', RETURNING: 'truck', ATHUB: 'hub', WORKSHOP: 'wrench', REPAIRING: 'gear', REPAIRED: 'check', TO_CUST: 'truck', CLOSED: 'check', REJECTED: 'ban', CANCELLED: 'ban' };
 function jobRow(j, me) {
   const mine = myTurn(j, me), late = isLate(j);
   const tone = late ? 'bad' : !isOpenStatus(j.status) ? (j.status === 'CLOSED' ? 'ok' : j.status === 'REJECTED' ? 'bad' : '') : (ST[j.status] || {}).tone || '';
@@ -3743,15 +3925,24 @@ function jobRow(j, me) {
   else if (j.status === 'REPAIRING') extra = `${tmState(j) === 'running' ? 'Running' : tmState(j) === 'paused' ? 'Paused' : 'Not started'} · <span data-timer="${esc(j.id)}">${fmtDur(repairMs(j))}</span>`;
   const rem = j.status === 'RETURN' && (j.reminders || []).length ? `<span class="remline">${ic('bell', 'sm')}Team Leader reminder · ${esc(rel(j.reminders[j.reminders.length - 1].at))}</span>` : '';
   if (j.type === 'ret') return retRow(j, me, mine, tone);
+  if (isSvc(j)) return svcRow(j, me, mine, tone);
   const who = isCustPart(j) ? `Customer · ${esc(j.customer || '')}` : j.type === 'wsadd' ? `Workshop · ${esc(j.byName || '')}` : j.type === 'rep' ? `${esc(j.techName)}’s van` : j.type === 'hubrep' ? `${j.xfer ? 'To' : 'Refill ·'} ${esc(HUB_NAME[j.to] || j.to)}` : me.role !== 'TECH' ? esc(j.techName) : j.scn ? `<span class="mono">${esc(j.scn)}</span>` : '';
   const title = j.desc || partName(j.pn) || (j.type === 'rep' ? 'Van restock' : 'Request');
   return `<button class="jcard ${mine ? 'mine' : ''} ${late ? 'late' : ''}" data-a="sheet" data-s="job" data-id="${esc(j.id)}">
     <span class="j-ic ${tone ? 't-' + tone : ''}">${ic(j.type === 'rep' ? 'van' : ST_IC[j.status] || 'box')}</span>
     <span class="j-main"><span class="j-t1"><b>${esc(title)}</b><span class="when">${rel(j.updatedAt)}</span></span>
       <span class="j-t2">${tag(j.pn)}<span class="num">× ${jobQty(j)}</span>${who ? `<span>· ${who}</span>` : ''}${kindPills(j)}</span>
-      <span class="j-t3">${mine && stNext(j) ? `<span class="next">${esc(stNext(j))}${ic('chev')}</span>` : stChip(j)}${lateChip(j)}</span>
+      <span class="j-t3">${mine && stNext(j) ? `<span class="next">${esc(stNext(j))}${ic('chev')}</span>` : stChip(j)}${lateChip(j)}${slaChip(j)}</span>
       ${extra ? `<span class="wait">${extra}</span>` : ''}${rem}</span>
   </button>`;
+}
+/* a chargeable case with no part in a list: the work, the machine and the service call (22 Nov 2026) */
+function svcRow(j, me, mine, tone) {
+  return `<button class="jcard ${mine ? 'mine' : ''}" data-a="sheet" data-s="job" data-id="${esc(j.id)}">
+    <span class="j-ic ${tone ? 't-' + tone : ''}">${ic(ST_IC[j.status] || 'wallet')}</span>
+    <span class="j-main"><span class="j-t1"><b>${esc(j.work || 'Chargeable case')}</b><span class="when">${rel(j.updatedAt)}</span></span>
+      <span class="j-t2"><span class="mono">${esc(j.machine || '–')}</span>${me.role !== 'TECH' ? `<span>· ${esc(j.techName)}</span>` : `<span>· <span class="mono">${esc(j.scn || '')}</span></span>`}${kindPills(j)}</span>
+      <span class="j-t3">${mine && stNext(j) ? `<span class="next">${esc(stNext(j))}${ic('chev')}</span>` : stChip(j)}${slaChip(j)}</span></span></button>`;
 }
 /* multi-part requests waiting for the Team Leader show as ONE card (the group); everything else as its own card */
 function todoRows(jobs, me) {
@@ -3787,6 +3978,8 @@ function todoView(me) {
     if (late.length) alerts += alertBox('bad', 'clock', `${late.length} return${late.length === 1 ? '' : 's'} overdue`, esc([...new Set(late.map(j => j.techName))].join(', ')), `<button class="btn sm sec" data-a="goReport" data-v="returns">Review</button>`);
     const low = lowStock().filter(x => x.kind === 'low');
     if (low.length) alerts += alertBox('warn', 'box', `${low.length} part${low.length === 1 ? '' : 's'} below the minimum`, lows(low), `<button class="btn sm sec" data-a="goReport" data-v="stock">View</button>`);
+    const asks = slaAsks(me);   /* SLA (20 Nov 2026) */
+    if (asks.length) alerts += alertBox('warn', 'clock', `${asks.length} hold request${asks.length === 1 ? '' : 's'} to decide`, esc(asks.slice(0, 3).map(j => (slaHold(j) || {}).by).join(', ')), `<button class="btn sm sec" data-a="goReport" data-v="sla">Review</button>`);
   }
   if (me.role === 'STOCK') {
     const low = lowStock().filter(x => x.kind === 'low');
@@ -3814,7 +4007,7 @@ function todoView(me) {
 
 const FILTERS = [['open', 'Open'], ['closed', 'Completed'], ['rejected', 'Rejected'], ['all', 'All']];
 const inFilter = (j, f) => f === 'all' || (f === 'open' ? isOpenStatus(j.status) : f === 'closed' ? j.status === 'CLOSED' : ['REJECTED', 'CANCELLED'].includes(j.status));
-function jobText(j) { return [j.id, j.pn, j.desc, j.scn, j.machine, j.model, j.techName, j.customer, j.dispatch && j.dispatch.sn, j.ret && j.ret.sn, j.ret && j.ret.snWas, j.parent].join(' ').toLowerCase(); }
+function jobText(j) { return [j.id, j.pn, j.desc, j.details, j.scn, j.machine, j.model, j.techName, j.customer, j.dispatch && j.dispatch.sn, j.ret && j.ret.sn, j.ret && j.ret.snWas, j.parent].join(' ').toLowerCase(); }
 function allView(me) {
   const base = myJobs(me), f = UI.filter || 'open';
   const cnt = {}; for (const [v] of FILTERS) cnt[v] = base.filter(j => inFilter(j, v)).length;
@@ -3835,17 +4028,23 @@ function allList(me) {
 /* chargeable replaced parts the engineer sent back to Stock with the Delivery Note photo, or left with the customer
    (No return). Read only: the coordinator updates the cash charge case outside SPMS. */
 function ccView() {
-  return `<button class="btn sec block" data-a="ccxl">${ic('download', 'sm')}Download Excel · all cases</button>
+  const me = ME(), todo = JOBS.filter(j => isSvc(j) && j.status === 'SC_CONF' && myTurn(j, me)).sort((a, b) => (+a.updatedAt || 0) - (+b.updatedAt || 0));
+  const conf = todo.length ? `<section class="blk"><div class="sec-h"><h2>To confirm · ${todo.length}</h2></div><div class="jobs">${todo.map(j => svcRow(j, me, true, '')).join('')}</div></section>` : '';
+  return `${conf}<button class="btn sec block" data-a="ccxl">${ic('download', 'sm')}Download Excel · all cases</button>
   ${searchBox('ccq', 'ccq', 'Search part, SCN, machine, serial, engineer', UI.ccq || '')}<div id="live-cc">${ccList()}</div>`;
 }
+/* every cash-charge case: parts sent back or left with the customer, and chargeable cases with no part (22 Nov 2026) */
+const ccAny = j => ccCase(j) || svcCase(j);
+const ccAt = j => isSvc(j) ? +(j.tl && j.tl.at) || +j.updatedAt || 0 : +j.ret.dnAt || +j.updatedAt || 0;
 function ccList() {
   const q = String(UI.ccq || '').trim().toLowerCase();
-  const all = JOBS.filter(ccCase).filter(j => !q || jobText(j).includes(q)).sort((a, b) => (+b.ret.dnAt || +b.updatedAt || 0) - (+a.ret.dnAt || +a.updatedAt || 0));
+  const all = JOBS.filter(ccAny).filter(j => !q || jobText(j).includes(q)).sort((a, b) => ccAt(b) - ccAt(a));
   const shown = all.slice(0, 200);
   const more = allLoaded() ? '' : `<button class="btn sec block" data-a="older">${ic('clock', 'sm')}Load older requests</button>`;
-  return `${shown.length ? `<div class="jobs">${shown.map(ccRow).join('')}</div>` : emptyBox(q ? 'No matches' : 'No cash-charge cases yet', q ? 'Try another search.' : 'When an engineer sends back a cash-charge part, or leaves it with the customer, it shows here with the Delivery Note photo.')}${all.length > shown.length ? `<p class="note">Showing 200 of ${all.length}. Search to narrow it.</p>` : ''}${more}`;
+  return `${shown.length ? `<div class="jobs">${shown.map(ccRow).join('')}</div>` : emptyBox(q ? 'No matches' : 'No cash-charge cases yet', q ? 'Try another search.' : 'When an engineer sends back a cash-charge part, or leaves it with the customer, it shows here with the Delivery Note photo. A chargeable case with no part shows here once the Team Leader approves it.')}${all.length > shown.length ? `<p class="note">Showing 200 of ${all.length}. Search to narrow it.</p>` : ''}${more}`;
 }
 function ccRow(j) {
+  if (isSvc(j)) return svcRow(j, ME(), false, j.status === 'CLOSED' ? 'ok' : '');
   const r = j.ret, title = r.name || j.desc || partName(r.pn) || 'Part';
   return `<button class="jcard" data-a="sheet" data-s="job" data-id="${esc(j.id)}">
     <span class="j-ic ${r.noReturn ? 't-warn' : 't-ok'}">${ic(r.noReturn ? 'pin' : 'ret')}</span>
@@ -3947,6 +4146,7 @@ function dbView(me) {
       <div class="card"><div class="sec-h" style="padding:0"><h2>Auto-Rep approval limits</h2></div><div class="two"><div class="fld"><label class="lbl" for="p-autoMaxValue">Up to value (AED)</label><input class="inp num" id="p-autoMaxValue" data-draft="autoMaxValue" type="number" min="0" step="any" inputmode="decimal" value="${esc(draft('autoMaxValue', POLICY.autoMaxValue))}"></div><div class="fld"><label class="lbl" for="p-autoMaxQty">Up to units</label><input class="inp num" id="p-autoMaxQty" data-draft="autoMaxQty" type="number" min="0" step="1" inputmode="numeric" value="${esc(draft('autoMaxQty', POLICY.autoMaxQty))}"></div></div><button class="btn sm sec" data-a="savePolicy">Save limits</button><span class="hint">Smaller restocks skip your approval</span></div>
     </div>
     <div class="card"><div class="sec-h" style="padding:0"><h2>Return deadline</h2></div><div class="two"><div class="fld"><label class="lbl" for="rd-dmh">Dubai Main Hub (days)</label><input class="inp num" id="rd-dmh" data-draft="rdDmh" type="number" min="1" max="60" step="1" inputmode="numeric" value="${esc(draft('rdDmh', RETURN_DAYS.DMH))}"></div><div class="fld"><label class="lbl" for="rd-other">Other hubs (days)</label><input class="inp num" id="rd-other" data-draft="rdOther" type="number" min="1" max="60" step="1" inputmode="numeric" value="${esc(draft('rdOther', RETURN_DAYS_OTHER))}"></div></div><button class="btn sm sec" data-a="saveReturns">Save deadline</button><span class="hint">Counted from the install. When a return is overdue, SPMS emails the engineer, with the Team Leader and the Technical Manager in copy.</span></div>
+    ${slaDbCard()}
     ${UI.fbMode ? `<div class="card"><div class="sec-h" style="padding:0"><h2>Staff accounts</h2><button class="btn sm" data-a="sheet" data-s="accounts">${ic('user', 'sm')}Manage</button></div><span class="hint">${USERS.filter(u => u.active !== false).length} people can sign in · ${USERS.filter(u => u.active !== false && u.role === 'TECH').length} engineers</span></div>` : ''}
     ${UI.fbMode && me.role === 'TL' ? `<div class="card"><div class="sec-h" style="padding:0"><h2>Security</h2><button class="btn sm sec" data-a="sheet" data-s="security">${ic('lock', 'sm')}2-factor login</button></div><span class="hint">${UI.otpOn ? 'On · a login code the first time on each phone' : 'Off · sign in with email and password only'} · passwords change every 90 days</span></div>` : ''}
     ${UI.fbMode ? '' : `<div class="card"><div class="sec-h" style="padding:0"><h2>Passwords</h2><button class="btn sm sec" data-a="sheet" data-s="pwreset">${ic('ret', 'sm')}Reset a password</button></div><span class="hint">Everyone can change their own password in their profile</span></div>`}
@@ -3970,6 +4170,7 @@ function openSheet(name, p) {
   renderSheet(true); $('#sheet-host').classList.add('open');
   for (const s of BG) { const n = $(s); if (n) n.inert = true; }
   const t = $('#sheet-title'); if (t) t.focus({ preventScroll: true });
+  queueBack();
 }
 function closeSheet() {
   if (!UI.sheet) return; UI.sheet = null; $('#sheet-host').classList.remove('open');
@@ -3977,6 +4178,7 @@ function closeSheet() {
   setTimeout(() => { if (!UI.sheet) $('#sheet').innerHTML = ''; }, 260);
   const k = UI.opener; UI.opener = null;
   const el = k && document.querySelector(k); if (el) el.focus({ preventScroll: true });
+  queueBack();
 }
 function renderSheet(fresh) {
   const s = UI.sheet; if (!s) return;
@@ -4019,7 +4221,7 @@ function chime(force) {
 }
 let headsT;
 const HEAD_TITLE = { TL: 'New part request', STOCK: 'Approved · ready to send', DISPATCHED: 'Part on the way to you', RECEIVED: 'Record the replacement', RETURN: 'Return due', RETURNING: 'Return on the way', ATHUB: 'Return to route', WORKSHOP: 'Part sent for repair', REPAIRING: 'Repair to finish', REPAIRED: 'Repaired part coming back' };
-function headTitle(j) { if (j.type === 'wsadd') return { TL: 'Workshop part to approve', WORKSHOP: 'Workshop part approved · ready to repair', REJECTED: 'Workshop part rejected', TO_CUST: 'Customer part to send' }[j.status] || HEAD_TITLE[j.status] || stLabel(j); if (j.type === 'ret') return j.status === 'RETURNING' ? 'Parts coming back to the Main Hub' : stLabel(j); if (j.type === 'rep') return { TL: 'Van restock to approve', STOCK: 'Van restock to send', DISPATCHED: 'Restock on the way to your van' }[j.status] || 'Van restock'; return HEAD_TITLE[j.status] || stNext(j) || 'Update'; }
+function headTitle(j) { if (isSvc(j)) return { TL: 'Chargeable case to approve', SC_CONF: 'Chargeable case to confirm', REJECTED: 'Chargeable case rejected' }[j.status] || stLabel(j); if (j.type === 'wsadd') return { TL: 'Workshop part to approve', WORKSHOP: 'Workshop part approved · ready to repair', REJECTED: 'Workshop part rejected', TO_CUST: 'Customer part to send' }[j.status] || HEAD_TITLE[j.status] || stLabel(j); if (j.type === 'ret') return j.status === 'RETURNING' ? 'Parts coming back to the Main Hub' : stLabel(j); if (j.type === 'rep') return { TL: 'Van restock to approve', STOCK: 'Van restock to send', DISPATCHED: 'Restock on the way to your van' }[j.status] || 'Van restock'; return HEAD_TITLE[j.status] || stNext(j) || 'Update'; }
 function headsUp(items) {
   if (!items.length) return;
   const it = items[0], more = items.length - 1;
@@ -4031,7 +4233,7 @@ function headsUp(items) {
 }
 function hideHeads() { clearTimeout(headsT); const h = $('#heads'); if (h) h.classList.remove('show'); }
 function hideHeadsFor(id) { const h = $('#heads'); if (h && h.classList.contains('show') && h.querySelector(`[data-id="${CSS.escape(id)}"]`)) hideHeads(); }
-const jobHead = j => ({ s: 'job', id: j.id, icon: j.type === 'rep' ? 'van' : ST_IC[j.status] || 'bell2', title: headTitle(j), urgent: j.urgency === 'urgent' && j.status === 'TL', line: j.type === 'wsadd' ? `${j.pn} × ${jobQty(j)}${j.desc ? ' · ' + j.desc : ''} · ${isCustPart(j) ? 'for ' + (j.customer || 'the customer') : 'added by ' + (j.byName || 'the Workshop')}` : j.type === 'ret' ? `${jobQty(j)} part${jobQty(j) === 1 ? '' : 's'} · ${j.desc || ''} · ${j.techName}` : `${j.pn} × ${jobQty(j)}${j.desc ? ' · ' + j.desc : ''} · ${j.type === 'rep' ? j.techName + '’s van' : j.techName}` });
+const jobHead = j => ({ s: 'job', id: j.id, icon: j.type === 'rep' ? 'van' : ST_IC[j.status] || 'bell2', title: headTitle(j), urgent: j.urgency === 'urgent' && j.status === 'TL', line: isSvc(j) ? `${j.work || 'Chargeable case'} · no part · ${j.machine || ''} · ${j.scn || ''} · ${j.techName || ''}` : j.type === 'wsadd' ? `${j.pn} × ${jobQty(j)}${j.desc ? ' · ' + j.desc : ''} · ${isCustPart(j) ? 'for ' + (j.customer || 'the customer') : 'added by ' + (j.byName || 'the Workshop')}` : j.type === 'ret' ? `${jobQty(j)} part${jobQty(j) === 1 ? '' : 's'} · ${j.desc || ''} · ${j.techName}` : `${j.pn} × ${jobQty(j)}${j.desc ? ' · ' + j.desc : ''} · ${j.type === 'rep' ? j.techName + '’s van' : j.techName}` });
 
 
 function sheetErr(e) {
@@ -4113,6 +4315,7 @@ const histFold = (j, turn) => `<details class="fold"${turn ? '' : ' open'}><summ
 SH.job = (d, p) => {
   const j = JOB(p.id); if (!j) return { title: 'Not found', body: emptyBox('This request no longer exists', '') };
   if (j.type === 'ret') return retSheet(j, d);
+  if (isSvc(j)) return svcSheet(j, d);
   const me = ME(), turn = myTurn(j, me), alts = altActions(j, me);
   let a = null;
   if (d.alt) a = altForm(j, me, d); else if (turn) a = actionForm(j, me, d);
@@ -4127,7 +4330,7 @@ SH.job = (d, p) => {
     : j.type === 'rep' ? fact('Van', esc(j.techName)) + fact('Why', esc(j.reason || 'Van restock')) + fact('Value', money(jobQty(j) * (+part(j.pn).price || 0))) + fact('Raised', fmtD(j.createdAt))
     : stockReq(j) ? fact('Engineer', esc(j.techName)) + fact('For', j.forHub ? esc((HUB_NAME[j.hub] || j.hub) + ' shelf') : 'Van stock') + fact('Value', money(jobQty(j) * (+(j.unit != null ? j.unit : part(j.pn).price) || 0))) + fact('Raised', fmtD(j.createdAt))
     : fact('Engineer', esc(j.techName)) + fact('Service call', `<span class="mono">${esc(j.scn || '–')}</span>`) + fact('Machine', `<span class="mono">${esc(j.machine || '–')}${j.machineSn && j.machineSn !== j.machine ? ' · SN ' + esc(j.machineSn) : ''}</span>`) + fact(j.customer || !j.site ? 'Customer' : 'Site', esc(j.customer || j.site || '–'));
-  const head = `<div class="card"><div class="chips">${tag(j.pn)}<b class="num">× ${jobQty(j)}</b>${stChip(j)}${lateChip(j)}${kindPills(j)}</div>${j.desc ? `<div class="jh-t">${esc(j.desc)}</div>` : ''}<div class="facts">${facts}</div>${['TL', 'STOCK'].includes(j.status) ? `<div class="t3 muted">In stock: ${esc(availText(j.pn))}</div>` : ''}${pbar}${stWho(j) && !turn ? `<div class="infobox nextbox"><span>Next: <b>${esc(ROLE[stWho(j)])}${stepOwner(j) && stepOwner(j).name ? ' (' + esc(stepOwner(j).name) + ')' : ''}</b> · ${esc(stNext(j))}</span></div>` : ''}</div>`;
+  const head = `<div class="card"><div class="chips">${tag(j.pn)}<b class="num">× ${jobQty(j)}</b>${stChip(j)}${lateChip(j)}${slaChip(j)}${kindPills(j)}</div>${j.desc ? `<div class="jh-t">${esc(j.desc)}</div>` : ''}<div class="facts">${facts}</div>${['TL', 'STOCK'].includes(j.status) ? `<div class="t3 muted">In stock: ${esc(availText(j.pn))}</div>` : ''}${pbar}${slaBox(j, me)}${stWho(j) && !turn ? `<div class="infobox nextbox"><span>Next: <b>${esc(ROLE[stWho(j)])}${stepOwner(j) && stepOwner(j).name ? ' (' + esc(stepOwner(j).name) + ')' : ''}</b> · ${esc(stNext(j))}</span></div>` : ''}</div>`;
   const info = `<details class="fold"><summary>Details<span class="t3 mono">${esc(j.id)}</span></summary><div class="fold-b">${dl([['Reference', `<span class="mono">${esc(j.id)}</span>`], ['Hub', esc(HUB_NAME[jobHub(j)] || jobHub(j))], j.parent && [j.backorder ? 'Back-order of' : 'Split from', jobLink(j.parent)],
       j.model && ['Model', esc(j.model)], j.contract && ['AMC / lease', esc(j.contract)], j.site && j.customer && ['Site', esc(j.site)],
       j.gps && ['GPS', `<a href="${mapsUrl(j.gps)}" target="_blank" rel="noopener">${(+j.gps.lat).toFixed(5)}, ${(+j.gps.lng).toFixed(5)} · open map</a>`], j.note && ['Note', esc(j.note)],
@@ -4231,7 +4434,7 @@ function altActions(j, me) {
   if (me.role === 'WS' && j.status === 'REPAIRING' && myTurn(j, me) && tmState(j) !== 'new' && d0(j)) out.push(['fixtime', 'Correct repair time']);
   if (me.role === 'WS' && j.status === 'REPAIRING' && myTurn(j, me) && d0(j)) out.push(['scrap', isCustPart(j) ? 'Can’t be repaired · back to the customer' : 'Scrap · can’t be repaired']);
   if (me.role === 'TL' && lastUndo(j) && inMyHub(jobHub(j), me)) out.push(['undo', 'Undo the last step']);
-  return out;
+  return out.concat(slaAlts(j, me));   /* SLA hold (20 Nov 2026) */
 }
 const d0 = () => !(UI.sheet && UI.sheet.d.mode === 'finish');
 /* the Team Leader undoes the last step of a request (15 Nov 2026): the panel shows the step, where the request goes
@@ -4248,6 +4451,7 @@ function undoForm(j, d) {
     op: { label: 'Undo step', cls: 'danger', danger: true, yes: 'Yes, undo it', check: () => checkUndo(j, d), run: () => tlUndo(j.id, d), stay: true, ok: 'Step undone' } };
 }
 function altForm(j, me, d) {
+  if (/^hold/.test(d.alt || '')) return slaAltForm(j, me, d);   /* SLA hold (20 Nov 2026) */
   switch (d.alt) {
     case 'cancel': return { title: j.type === 'van' ? 'Cancel van part use' : 'Cancel request', form: box(`<p style="margin:0">Cancel the ${j.type === 'van' ? 'use of' : 'request for'} <b>${esc(j.pn)} × ${j.qty}</b>${j.type === 'van' ? ' from your van' : ''} on <span class="mono">${esc(j.scn)}</span>? Use this when the part is no longer needed.</p>${area(d, 'cnote', 'Reason (optional)', 'e.g. Fixed without a new part')}`), op: { label: 'Cancel', cls: 'danger', danger: true, yes: 'Yes, cancel it', check: () => j.type === 'van' ? 'Cancel this? The part stays in your van.' : 'Cancel this request? It will close and Stock won’t send the part.', run: () => techCancel(j.id, d), ok: j.type === 'van' ? 'Cancelled' : 'Request cancelled' } };
     case 'pnfix': return { title: 'Change part number', form: box(`<p style="margin:0">The request is for <b class="mono">${esc(j.pn)}</b>${j.desc ? ' (' + esc(j.desc) + ')' : ''} × ${j.qtyApproved || j.qty}. Change it when the engineer typed the wrong number or another part number replaces it.</p>
@@ -4639,7 +4843,7 @@ function compressPhoto(file) {
   });
 }
 async function addPhotos(key, files) {
-  const s = UI.sheet; if (!s) return; const d = s.d; d[key] = d[key] || []; const max = key === 'rcpt' ? RCPT_MAX : key === 'dn' ? DN_MAX : PHOTO_MAX;
+  const s = UI.sheet; if (!s) return; const d = s.d; d[key] = d[key] || []; const max = key === 'rcpt' ? RCPT_MAX : key === 'dn' ? DN_MAX : key === 'sar' ? SAR_MAX : PHOTO_MAX;
   for (const f of files) {
     if (d[key].length >= max) { toast(max === 1 ? 'One photo here.' : `Up to ${max} photos.`); break; }
     if (!/^image\//.test(f.type)) continue;
@@ -4670,9 +4874,9 @@ function photoView(src) {
   v.setAttribute('role', 'dialog'); v.setAttribute('aria-modal', 'true'); v.setAttribute('aria-label', 'Photo');
   v.innerHTML = `<div class="pv-b" data-a="photoZoom"><img alt="Photo"></div><button type="button" class="pv-x" data-a="photoClose" aria-label="Close photo">${ic('x', 'sm')}</button>`;
   v.querySelector('img').src = src;
-  $('#app').appendChild(v); v.querySelector('.pv-x').focus();
+  $('#app').appendChild(v); v.querySelector('.pv-x').focus(); queueBack();
 }
-function photoClose() { const v = $('#pv'); if (!v) return; v.remove(); const f = UI.pvFrom; UI.pvFrom = null; if (f && document.contains(f)) f.focus({ preventScroll: true }); }
+function photoClose() { const v = $('#pv'); if (!v) return; v.remove(); const f = UI.pvFrom; UI.pvFrom = null; if (f && document.contains(f)) f.focus({ preventScroll: true }); queueBack(); }
 SH.new = d => {
   if (d._review) return newReview(d);
   if (!d.qty) d.qty = 1; if (!d.urgency) d.urgency = 'normal'; if (d.forVan == null) d.forVan = ''; if (!HUBS.includes(d.hub)) { d.hub = myHub(); d._hubGps = false; }
@@ -4795,6 +4999,58 @@ function retSheet(j, d) {
   if (me && me.role === 'TL' && lastUndo(j) && inMyHub(jobHub(j), me)) body += `<div class="alts"><button class="btn sm sec" data-a="alt" data-v="undo">Undo the last step</button></div>`;
   body += histFold(j, turn);
   return { title: turn && open ? stNext(j) : 'Return to the Main Hub', sub: `${esc(j.techName)} · <span class="mono">${esc(j.id)}</span>`, body, op };
+}
+
+/* ---------- chargeable case with no part (22 Nov 2026), e.g. a SW reload ---------- */
+/* the engineer: the machine, the work and its details, the service call number and one photo of the signed SAR */
+SH.svc = d => {
+  const me = ME(); if (!me || me.role !== 'TECH') return { title: 'Chargeable case · no part', body: '<div class="err">Only an engineer can open this.</div>' };
+  return {
+    title: 'Chargeable case · no part', sub: 'No spare part · goes to the Team Leader, then the Service Coordinator',
+    body: `<div class="infobox">${ic('wallet', 'sm')}<span>For work the customer pays for without a spare part, for example a SW reload. Nothing goes through Stock and nothing is taken from your budget. The Team Leader approves it, then the Service Coordinator confirms he received it.</span></div>
+      ${fld('Work *', segBtns(d, 'work', SVC_WORK.map(w => [w, w])))}
+      ${area(d, 'details', 'Details *', d.work === 'Other' ? 'What work did you do?' : 'e.g. Software version loaded, reason for the reload')}
+      ${inp(d, 'scn', 'Service Call Number *', 'e.g. SCN-26-04831', { mono: true, auto: 'scn' })}${machineField(d)}${autoHint(d, 'scn', 'machine')}
+      <div class="two">${inp(d, 'model', 'Machine model', '')}${inp(d, 'customer', 'Customer / bank', '')}</div>${inp(d, 'site', 'Site', 'Branch or address')}
+      ${photoField(d, 'sar', 'Photo of the signed SAR', true, { max: SAR_MAX, need: 'A photo of the SAR signed by the customer is required.', ok: 'The Team Leader and the Service Coordinator can see it.' })}`,
+    op: { label: 'Send to Team Leader', check: () => { const c = checkSvc(d); return `Send this chargeable case (${c.work} on ${c.scn}) to the Team Leader?`; }, run: () => createSvc(d), after: () => { UI.tab = 'all'; UI.filter = 'open'; }, ok: 'Sent to the Team Leader' }
+  };
+};
+/* the case itself: the Team Leader approves or rejects it, the Service Coordinator confirms he received it */
+function svcSheet(j, d) {
+  const me = ME(), turn = myTurn(j, me);
+  const fact = (k, v) => v ? `<div class="fact"><span>${k}</span><b>${v}</b></div>` : '';
+  const sub = `${esc(j.techName)} · <span class="mono">${esc(j.scn || j.id)}</span>`;
+  if (d.alt === 'undo') { const a = undoForm(j, d); return { title: a.title, sub, body: a.form + histFold(j, false), op: a.op }; }
+  if (/^hold/.test(d.alt || '')) { const a = slaAltForm(j, me, d); return { title: a.title, sub, body: a.form + histFold(j, false), op: a.op }; }
+  if (d.alt === 'cancel') return { title: 'Cancel chargeable case', sub, body: box(`<p style="margin:0">Cancel the chargeable case <b>${esc(j.work || '')}</b> on <span class="mono">${esc(j.scn)}</span>? Use this when it was sent by mistake.</p>${area(d, 'cnote', 'Reason (optional)', 'e.g. Wrong machine')}`) + histFold(j, false),
+    op: { label: 'Cancel', cls: 'danger', danger: true, yes: 'Yes, cancel it', check: () => 'Cancel this chargeable case? It closes and the Team Leader no longer sees it.', run: () => techCancel(j.id, d), ok: 'Cancelled' } };
+  const st = steps(j), cur = st.findIndex(x => !x[1]), doneN = st.filter(x => x[1]).length;
+  const pbar = ['REJECTED', 'CANCELLED'].includes(j.status) ? '' : `<div class="pbar" aria-label="${doneN} of ${st.length} steps done"><div class="segs">${st.map(([, ok], i) => `<i class="${ok ? 'on' : i === cur ? 'cur' : ''}"></i>`).join('')}</div><div class="lab"><span>${cur < 0 ? '<b>All steps done</b>' : `Next: <b>${esc(st[cur][0])}</b>`}</span><span>${doneN} of ${st.length}</span></div></div>`;
+  const facts = fact('Engineer', esc(j.techName)) + fact('Work', esc(j.work || '')) + fact('Service call', `<span class="mono">${esc(j.scn || '–')}</span>`)
+    + fact('Machine', `<span class="mono">${esc(j.machine || '–')}${j.machineSn && j.machineSn !== j.machine ? ' · SN ' + esc(j.machineSn) : ''}</span>`) + fact(j.customer || !j.site ? 'Customer' : 'Site', esc(j.customer || j.site || '–')) + fact('Sent', fmtDT(j.createdAt));
+  let body = `<div class="card"><div class="chips">${stChip(j)}${slaChip(j)}${kindPills(j)}</div><div class="jh-t">${esc(j.work || 'Chargeable case')} · no part</div><div class="facts">${facts}</div>${j.details ? `<p style="margin:0;white-space:pre-wrap">${esc(j.details)}</p>` : ''}${pbar}${slaBox(j, me)}${stWho(j) && !turn ? `<div class="infobox nextbox"><span>Next: <b>${esc(ROLE[stWho(j)])}</b> · ${esc(stNext(j))}</span></div>` : ''}</div>`;
+  let op = null;
+  if (turn && j.status === 'TL') {
+    if (!d.mode) d.mode = 'approve';
+    body += box(`<div class="infobox">${ic('wallet', 'sm')}<span>${esc(j.techName)} did <b>${esc(j.work || '')}</b> on <span class="mono">${esc(j.machine || '')}</span> with no spare part. After you approve, the Service Coordinator gets it with the SAR photo and confirms he received it.</span></div>
+      ${segBtns(d, 'mode', [['approve', 'Approve'], ['reject', 'Reject']])}${area(d, 'remarks', d.mode === 'reject' ? 'Why are you rejecting it? *' : 'Remarks (optional)', 'Visible to the engineer')}`);
+    op = { label: d.mode === 'reject' ? 'Reject' : 'Approve', cls: d.mode === 'reject' ? 'danger' : 'ok', danger: true, yes: 'Yes, reject', check: () => checkTl(j, d), run: () => tlDecide(j.id, d), ok: d.mode === 'reject' ? 'Rejected' : 'Approved. Next: the Service Coordinator' };
+  } else if (turn && j.status === 'SC_CONF') {
+    body += box(`<p style="margin:0">Approved by ${esc((j.tl && j.tl.by) || 'the Team Leader')}${j.tl && j.tl.at ? ', ' + fmtDT(j.tl.at) : ''}${j.tl && j.tl.note ? ': ' + esc(j.tl.note) : ''}. Check the SAR photo below, then confirm you received this chargeable case. It closes.</p>${area(d, 'scnote', 'Note (optional)', 'e.g. Cash charge case number')}`);
+    op = { label: 'Confirm receipt', cls: 'ok', yes: 'Yes, confirm', check: () => 'Confirm you received this chargeable case? It closes.', run: () => scConfirm(j.id, d), ok: 'Received · the case is closed' };
+  }
+  const alts = [];
+  if (me && me.role === 'TECH' && j.techId === me.id && j.status === 'TL') alts.push(['cancel', 'Cancel']);
+  if (me && me.role === 'TL' && lastUndo(j) && inMyHub(jobHub(j), me)) alts.push(['undo', 'Undo the last step']);
+  for (const x of slaAlts(j, me)) alts.push(x);
+  if (alts.length) body += `<div class="alts">${alts.map(([v, l]) => `<button class="btn sm sec" data-a="alt" data-v="${v}">${esc(l)}</button>`).join('')}</div>`;
+  body += `<details class="fold"><summary>Details<span class="t3 mono">${esc(j.id)}</span></summary><div class="fold-b">${dl([['Reference', `<span class="mono">${esc(j.id)}</span>`], ['Hub', esc(HUB_NAME[jobHub(j)] || jobHub(j))], j.model && ['Model', esc(j.model)], j.site && j.customer && ['Site', esc(j.site)],
+    j.tl && ['Team Leader', `${j.tl.rejected ? '<b>Rejected</b>' : 'Approved'} by ${esc(j.tl.by)}, ${fmtDT(j.tl.at)}${j.tl.note ? ': ' + esc(j.tl.note) : ''}`],
+    j.sc && ['Service Coordinator', `Received by ${esc(j.sc.by)}, ${fmtDT(j.sc.at)}${j.sc.note ? ': ' + esc(j.sc.note) : ''}`], j.outcome && ['Outcome', esc(j.outcome)]])}</div></details>`;
+  body += `<section class="blk"><div class="card">${photoStrip(j.sar, 'SAR · signed by the customer')}</div></section>`;
+  body += histFold(j, turn);
+  return { title: turn ? stNext(j) : 'Chargeable case · no part', sub, body, op };
 }
 
 /* ---------- engineer: add a part to their own van ---------- */
@@ -5615,7 +5871,7 @@ SH.help = d => {
 /* ==========================================================================
    Reports for the Team Leader and the Operations Manager (on screen) and the Excel workbook
    ========================================================================== */
-const REPORTS = [['dash', 'Dashboard'], ['returns', 'Returns'], ['stock', 'Stock levels'], ['eng', 'Engineers'], ['moves', 'Movements'], ['cons', 'Consumption'], ['cost', 'Repair cost'], ['wsperf', 'Workshop performance'], ['wsparts', 'Repaired parts'], ['trace', 'Serial trace'], ['audit', 'Audit log']];
+const REPORTS = [['dash', 'Dashboard'], ['returns', 'Returns'], ['sla', 'SLA'], ['stock', 'Stock levels'], ['eng', 'Engineers'], ['moves', 'Movements'], ['cons', 'Consumption'], ['cost', 'Repair cost'], ['wsperf', 'Workshop performance'], ['wsparts', 'Repaired parts'], ['trace', 'Serial trace'], ['audit', 'Audit log']];
 function reportsView(me) {
   if (!['TL', 'MGR'].includes(me.role) && !isWsLead(me)) return '<div class="err">Only the Team Leader, the Operations Manager or the Workshop Team Leader can see reports.</div>';
   const r = REPORTS.some(x => x[0] === UI.report) ? UI.report : 'dash';
@@ -5875,6 +6131,7 @@ function repDash() {
     ${dashHero(M, r, S)}
     ${S.all ? glanceCard(JOBS, r) : ''}
     ${returnsCard(R, 5)}
+    ${slaDashCard()}
     <div class="card dcard">${cardH('Parts moving', STEP_WORD[M.kind])}
       ${any ? lineChart(M.series, DASH_SERIES, `Parts taken from stock, back in stock and scrapped, ${rangeText(r)}`) : none('No parts moved in this period.')}
       <details class="fold inset" data-fold="dash-weeks"><summary>${ic('list', 'sm')}The numbers</summary><div class="fold-b">${tbl([STEP_COL[M.kind], 'Taken from stock', 'Installed', 'Back in stock', 'Scrapped'], M.series.slice().reverse().map((x, i) => `<tr><td>${esc(bucketLabel(x.b))}</td><td class="r">${x.taken}</td><td class="r">${M.tiles[1].trend[M.series.length - 1 - i]}</td><td class="r">${x.back}</td><td class="r">${x.scrap}</td></tr>`))}</div></details></div>
@@ -6024,7 +6281,7 @@ const REPORT_FN = { dash: repDash, returns: repReturns, stock: repStock, eng: re
 
 /* ---------- Excel workbook ---------- */
 const cv = x => x == null ? '' : x;
-const JOB_TYPE = { req: 'Request', rep: 'Van restock', van: 'Used from van', hubrep: 'Hub refill', ret: 'Return to Main Hub' };
+const JOB_TYPE = { req: 'Request', rep: 'Van restock', van: 'Used from van', hubrep: 'Hub refill', ret: 'Return to Main Hub', svc: 'Chargeable case · no part' };
 const REQ_COLS = [
   ['Request', j => j.id], ['Type', j => j.xfer ? 'Hub transfer' : JOB_TYPE[j.type] || 'Request'], ['Parent request', j => j.parent || ''], ['Created', j => isoDT(j.createdAt)], ['Engineer', j => j.techName],
   ['Part number', j => j.pn], ['Description', j => j.desc], ['Qty requested', j => j.qty], ['Qty approved', j => j.qtyApproved || ''], ['Qty sent', j => j.dispatch ? jobQty(j) : ''],
@@ -6042,12 +6299,16 @@ const REQ_COLS = [
 const DB_COLS = REQ_COLS.map(c => c[0]);
 /* Cash charge cases, one row each (19 Nov 2026): the Service Coordinator downloads them from the Cash charge tab,
    and the database workbook has the same sheet. */
-const CC_HEAD = ['Request', 'Date', 'Engineer', 'Part number', 'Part name', 'Serial number', 'Qty', 'Machine ID', 'Service call number', 'Customer', 'Where the part went'];
+/* chargeable cases with no part (22 Nov 2026) are in it too, from the Team Leader's approval: their details and when the
+   Service Coordinator confirmed he received them */
+const CC_HEAD = ['Request', 'Date', 'Engineer', 'Part number', 'Part name', 'Serial number', 'Qty', 'Machine ID', 'Service call number', 'Customer', 'Where the part went', 'Details (no part)', 'Received by Service Coordinator'];
 function ccRows(jobs) {
-  return jobs.filter(ccCase).sort((a, b) => (+b.ret.dnAt || +b.updatedAt || 0) - (+a.ret.dnAt || +a.updatedAt || 0)).map(j => {
+  return jobs.filter(ccAny).sort((a, b) => ccAt(b) - ccAt(a)).map(j => {
+    if (isSvc(j)) return [j.id, isoDT(ccAt(j)), j.techName || '', '', 'No part · ' + (j.work || ''), '', '', j.machine || '', j.scn || '', j.customer || '', 'No part', j.details || '',
+      j.sc ? isoDT(j.sc.at) + ' · ' + (j.sc.by || '') : 'Waiting'];
     const r = j.ret;
     return [j.id, isoDT(+r.dnAt || r.shippedAt || j.updatedAt), j.techName || '', r.pn || '', r.name || j.desc || partName(r.pn) || '', r.sn || '', r.qty || 1,
-      j.machine || '', j.scn || '', j.customer || '', r.noReturn ? 'No return · left with the customer' : 'Sent to Stock'];
+      j.machine || '', j.scn || '', j.customer || '', r.noReturn ? 'No return · left with the customer' : 'Sent to Stock', '', ''];
   });
 }
 function buildSheets(jobs, led, adj) {
@@ -6721,6 +6982,261 @@ SH.wspts = (d, p) => {
       <span class="hint">Points for a repaired part = weightage × quantity.</span>`,
     op: { label: 'Save weightage', run: () => saveWsPts(d), ok: k => k ? `Weightage saved for ${k} part${k === 1 ? '' : 's'}` : 'Nothing changed' } };
 };
+/* ==========================================================================
+   SLA (20 Nov 2026): the days each step may take, the red "SLA breached" tag, the hold with a reason, the SLA report.
+   The rules (working days, due day, breach, escalation) are in firebase-kit/functions/sla.js, shared with the Sender,
+   which sends the daily reminder, breach and escalation emails. settings/sla: { live, since, liveAt, days, by, at }.
+   - Report only (live false, the start): only the Technical Manager and the Operations Manager see the SLA tags; the
+     Technical Manager gets a daily summary of what would have been sent. Nobody else is told.
+   - Messages on (live true): everyone sees the tags and the Sender emails the people.
+   Every step a request passes is recorded on it (slaLog: the step, its start, due day, when and by whom it was done,
+   late or not) for the SLA report.
+   ========================================================================== */
+let SLA_CFG = { live: false, since: 0 };
+function setSla(doc) { SLA_CFG = Object.assign({}, doc || {}, { live: !!(doc && doc.live === true), since: +(doc && doc.since) || 0 }); slaMemo.days = null; }
+const slaMemo = { days: null, holSrc: null, hol: null };
+function slaDaysNow() { if (!slaMemo.days) slaMemo.days = slaDays(SLA_CFG); return slaMemo.days; }
+function slaHolNow() { const src = (WSPERF && WSPERF.holidays) || []; if (slaMemo.holSrc !== src) { slaMemo.holSrc = src; slaMemo.hol = slaHol(src); } return slaMemo.hol; }
+/* the hub whose days apply: the engineer's hub; for parts sent back to the Main Hub, the hub (or van) they came from */
+function slaHubOf(j) {
+  if (j.type === 'ret') { const f = String(j.from || ''); return f && !/^VAN-/.test(f) ? f : (accHub(ACC(j.techId)) || 'DMH'); }
+  return jobHub(j);
+}
+function slaOf(j, now) {
+  if (!j || !isOpenStatus(j.status)) return null;
+  return slaState(j, { days: slaDaysNow(), hol: slaHolNow(), hub: slaHubOf(j), now: now || Date.now() });
+}
+/* who sees the SLA on screen: everyone once messages are on; before that the Technical Manager and the Operations Manager */
+const slaSeen = me => !!me && (SLA_CFG.live || isTM(me) || me.role === 'MGR');
+/* who decides a hold: the Team Leader of the request's hub, or the Technical Manager */
+const slaBoss = (j, me) => !!me && (isTM(me) || (me.role === 'TL' && inMyHub(jobHub(j), me)));
+const lateDays = n => `${n} working day${n === 1 ? '' : 's'} late`;
+
+/* ---------- the record on each request: written with every save (saveJob) ---------- */
+function slaStamp(doc) {
+  if (!doc || !doc.status) return;
+  const s = doc.sla && typeof doc.sla === 'object' ? doc.sla : null;
+  if (s && s.st === doc.status) return;   /* the same step: nothing to record */
+  const prev = (REC && REC.id === doc.id && REC.base) || (doc.id && JOB(doc.id)) || null, now = +doc.updatedAt || Date.now();
+  /* a request saved before the SLA update, still at the same step (e.g. a reminder): it keeps the clock it had */
+  if (prev && prev.status === doc.status) { doc.sla = { st: doc.status, at: slaStart(prev) }; return; }
+  const h = doc.history || [], last = h[h.length - 1];
+  if (prev && prev.status && isOpenStatus(prev.status) && !(last && /^Step undone/.test(last.action || ''))) {
+    const x = slaOf(prev, now);
+    if (x) doc.slaLog = (Array.isArray(doc.slaLog) ? doc.slaLog : []).concat([{ k: x.k, st: prev.status, from: x.start, due: x.due, at: now, by: (last && last.by) || doc.updatedBy || '', byId: (last && last.byId) || '', role: (last && last.role) || '', hub: slaHubOf(prev), late: slaIsLate(x), held: x.stage === 'hold' }]).slice(-40);
+  }
+  doc.sla = { st: doc.status, at: now };
+}
+
+/* ---------- on screen ---------- */
+function slaChip(j) {
+  if (!slaSeen(ME())) return '';
+  const x = slaOf(j); if (!x) return '';
+  if (x.stage === 'hold') return `<span class="chip">${ic('clock', 'sm')}On hold</span>`;
+  if (slaIsLate(x)) return `<span class="chip bad">SLA breached</span>`;
+  if (x.hold) return '<span class="chip warn">Hold asked</span>';
+  return '';
+}
+/* the line in the request panel: the step, its due day, the hold */
+function slaBox(j, me) {
+  if (!slaSeen(me)) return '';
+  const x = slaOf(j); if (!x) return '';
+  const h = x.hold, due = slaDay(x.due);
+  const when = x.stage === 'hold' ? `on hold since ${fmtDT(h.ok.at)}` : x.stage === 'due' ? `<b>due today</b> (${esc(due)})` : slaIsLate(x) ? `<b class="bad-t">breached · due ${esc(due)}, ${lateDays(x.late)}${x.stage === 'esc' ? ' · escalated to the Technical Manager' : ''}</b>` : `due by ${esc(due)}`;
+  const hold = h ? `<br>${h.ok ? 'Hold' : '<b>Hold asked</b>'} by ${esc(h.by)}, ${fmtDT(h.at)}: ${esc(h.reason)}${h.ok && h.ok.by !== h.by ? ` · approved by ${esc(h.ok.by)}` : ''}${h.ok ? '' : ' · waiting for the Team Leader'}` : '';
+  return `<div class="infobox slabox"><span>${ic('clock', 'sm')}SLA · ${esc(x.step.label)}: ${when}${hold}</span></div>`;
+}
+/* the hold buttons in the request panel (as the other extra actions) */
+function slaAlts(j, me) {
+  if (!slaSeen(me)) return [];
+  const x = slaOf(j); if (!x) return [];
+  const boss = slaBoss(j, me), h = x.hold;
+  if (!h) return boss ? [['hold', 'Put on hold']] : myTurn(j, me) ? [['hold', 'Ask for a hold']] : [];
+  if (!boss) return [];
+  return h.ok ? [['holdend', 'End the hold']] : [['holdok', 'Approve the hold'], ['holdno', 'Refuse the hold']];
+}
+function slaAltForm(j, me, d) {
+  const x = slaOf(j), boss = slaBoss(j, me), h = x && x.hold;
+  const none = t => ({ title: t, form: box('<p style="margin:0">This changed meanwhile. Close and reopen the request.</p>'), op: null });
+  const what = x ? `<b>${esc(x.step.label)}</b> (${esc(ROLE[x.who] || x.step.who)})` : '';
+  switch (d.alt) {
+    case 'hold':
+      if (!x || h) return none('Hold');
+      return { title: boss ? 'Put on hold' : 'Ask for a hold',
+        form: box(`<p style="margin:0">Step: ${what}, due ${esc(slaDay(x.due))}. A hold stops the SLA clock when the step must wait for something outside SPMS.${boss ? '' : ' The Team Leader approves it first; until then the clock runs.'}</p>
+          ${area(d, 'hreason', 'Reason *', 'e.g. Customer site closed until Monday; courier delay')}<span class="hint">When the hold ends, the step gets its full days again from then.</span>`),
+        op: { label: boss ? 'Put on hold' : 'Ask for a hold', run: () => slaHoldAsk(j.id, d), stay: true, ok: boss ? 'On hold' : 'Hold asked · the Team Leader decides' } };
+    case 'holdok': case 'holdno': {
+      if (!x || !h || h.ok || !boss) return none('Hold');
+      const ok = d.alt === 'holdok';
+      return { title: ok ? 'Approve the hold' : 'Refuse the hold',
+        form: box(`<p style="margin:0">${esc(h.by)} asked for a hold on ${what}, ${fmtDT(h.at)}: <b>${esc(h.reason)}</b></p>${ok ? '<p style="margin:0">The SLA clock stops until you end the hold.</p>' : area(d, 'hnote', 'Note (optional)', 'e.g. Please send it today')}`),
+        op: { label: ok ? 'Approve the hold' : 'Refuse the hold', run: () => slaHoldDecide(j.id, ok, d), stay: true, ok: ok ? 'Hold approved' : 'Hold refused' } };
+    }
+    case 'holdend':
+      if (!x || !h || !h.ok || !boss) return none('End the hold');
+      return { title: 'End the hold', form: box(`<p style="margin:0">On hold since ${fmtDT(h.ok.at)}: ${esc(h.reason)}.</p><p style="margin:0">The step ${what} gets its full days again from now.</p>`),
+        op: { label: 'End the hold', run: () => slaHoldEnd(j.id), stay: true, ok: 'Hold ended · the clock runs again' } };
+  }
+  return none('Hold');
+}
+
+/* ---------- the hold (no step moves on; the history keeps every change) ---------- */
+async function slaWrite(id, fn) {
+  return withLocks(['jobs/' + id], async () => {
+    const raw = await api.get('jobs', id); if (!raw) throw E('This request no longer exists.');
+    const j = normJob(Object.assign({}, raw)), me = ME(); if (!me) throw E('Sign in again.');
+    const now = Date.now(), x = slaOf(j, now); if (!x) throw E('This step has no SLA. Close and reopen the request.');
+    /* only the SLA record, the history and the last change move (an engineer may change nothing else without a step) */
+    const out = fn(j, me, now, x), doc = Object.assign({}, raw, { sla: out.sla, updatedAt: now, updatedBy: me.name, history: (j.history || []).concat([{ at: now, by: me.name, byId: me.id || '', role: ROLE[me.role], action: out.action, note: out.note }]) });
+    return saveJob(doc);
+  });
+}
+const slaCur = (j, x) => j.sla && j.sla.st === j.status ? Object.assign({}, j.sla) : { st: j.status, at: x.start };
+async function slaHoldAsk(id, d) {
+  const reason = String(d.hreason || '').trim().replace(/\s+/g, ' ').slice(0, 300);
+  if (!reason) throw E('Write why the step has to wait.');
+  return slaWrite(id, (j, me, now, x) => {
+    if (x.hold) throw E(x.hold.ok ? 'This step is already on hold.' : 'A hold is already waiting for the Team Leader.');
+    const boss = slaBoss(j, me);
+    if (!boss && !myTurn(j, me)) throw E('Only the person who must do this step, or the Team Leader, can ask for a hold.');
+    const sla = slaCur(j, x); sla.hold = { at: now, by: me.name, byId: me.id || '', role: ROLE[me.role], reason, ok: boss ? { at: now, by: me.name } : null };
+    return { sla, action: boss ? 'Put on hold (SLA)' : 'Hold asked (SLA)', note: `${x.step.label}: ${reason}` };
+  });
+}
+async function slaHoldDecide(id, ok, d) {
+  const note = String((d && d.hnote) || '').trim().replace(/\s+/g, ' ').slice(0, 300);
+  return slaWrite(id, (j, me, now, x) => {
+    if (!slaBoss(j, me)) throw E('Only the Team Leader of this hub or the Technical Manager can decide a hold.');
+    const h = x.hold; if (!h || h.ok) throw E('There is no hold waiting for a decision. Close and reopen the request.');
+    const sla = slaCur(j, x);
+    if (ok) sla.hold = Object.assign({}, h, { ok: { at: now, by: me.name } }); else delete sla.hold;
+    return { sla, action: ok ? 'Hold approved (SLA)' : 'Hold refused (SLA)', note: `${x.step.label}: ${h.reason} (asked by ${h.by})${note ? ' · ' + note : ''}` };
+  });
+}
+async function slaHoldEnd(id) {
+  return slaWrite(id, (j, me, now, x) => {
+    if (!slaBoss(j, me)) throw E('Only the Team Leader of this hub or the Technical Manager can end a hold.');
+    const h = x.hold; if (!h || !h.ok) throw E('This step is not on hold. Close and reopen the request.');
+    const sla = slaCur(j, x); delete sla.hold; sla.from = now;
+    return { sla, action: 'Hold ended (SLA)', note: `${x.step.label}: the clock starts again (${h.reason})` };
+  });
+}
+/* hold requests waiting for this Team Leader */
+const slaAsks = me => slaSeen(me) ? JOBS_OPEN.filter(j => { const h = slaHold(j); return h && !h.ok && slaKey(j) && slaBoss(j, me); }) : [];
+
+/* ---------- Database → SLA (the Team Leader) ---------- */
+function slaDbCard() {
+  const d = slaDaysNow(), on = SLA_CFG.live;
+  const since = on ? (SLA_CFG.liveAt ? ' since ' + fmtD(SLA_CFG.liveAt) : '') : (SLA_CFG.since ? ' since ' + fmtD(SLA_CFG.since) : '');
+  return `<div class="card"><div class="sec-h" style="padding:0"><h2>SLA</h2><button class="btn sm sec" data-a="sheet" data-s="slaset">${ic('edit', 'sm')}Change</button></div><span class="hint">${on ? '<b>Messages on</b>' : '<b>Report only</b>'}${since} · ${on ? 'reminders, breaches and escalations go to the people' : 'nobody is told yet; the Technical Manager gets a daily summary'} · working days, Monday to Friday · e.g. Confirm receipt ${d.rcv[0]} day at the Dubai Main Hub, ${d.rcv[1]} at other hubs</span></div>`;
+}
+SH.slaset = d => {
+  const me = ME(); if (!me || me.role !== 'TL') return { title: 'SLA', body: '<div class="err">Only the Team Leader can change the SLA.</div>' };
+  const cur = slaDaysNow();
+  if (!d._i) { d.slive = SLA_CFG.live ? '1' : '0'; for (const s of SLA_STEPS) if (s.def) s.def.forEach((x, i) => { d['s_' + s.k + '_' + i] = String(cur[s.k][i]); }); d._i = 1; }
+  const num = (k, label) => `<div class="fld"><label class="lbl" for="f-${k}">${esc(label)}</label><input class="inp num" id="f-${k}" data-d="${k}" type="number" min="0" max="${SLA_MAX}" step="1" inputmode="numeric" value="${esc(d[k] || '')}"></div>`;
+  const rows = SLA_STEPS.map(s => {
+    const k0 = 's_' + s.k + '_0', k1 = 's_' + s.k + '_1';
+    const inputs = s.kind === 'hub' ? `<div class="two">${num(k0, 'Dubai Main Hub')}${num(k1, 'Other hubs')}</div>`
+        : s.kind === 'urg' ? `<div class="two">${num(k0, 'Normal')}${num(k1, 'Urgent')}</div>` : `<div class="two">${num(k0, 'Working days')}<span></span></div>`;
+    return `<div class="card" style="gap:6px"><div class="t1"><b>${esc(s.label)}</b> <span class="t3 muted">· ${esc(s.who)}</span></div>${inputs}</div>`;
+  }).join('');
+  const goLive = d.slive === '1' && !SLA_CFG.live;
+  return { title: 'SLA', sub: 'Working days each step may take',
+    body: box(`${fld('Messages', segBtns(d, 'slive', [['0', 'Report only'], ['1', 'Messages on']]))}<span class="hint">${d.slive === '1' ? 'Every working morning SPMS emails each person their steps due today and late, with the Team Leader in copy for late steps and the Technical Manager for escalated ones.' : 'Nobody is told. The Technical Manager gets a daily summary of what would be sent, so you can check the days first.'}</span>`)
+      + `<span class="hint">Working days are Monday to Friday, less the public holidays in Workshop performance → Leave &amp; holidays. A step is due by the end of the Nth working day after it reached the person; 0 means the same working day. SLA breached starts the next working day; 2 working days later it goes to the Technical Manager. Send the part back has no SLA: it keeps the Return deadline and its overdue email.</span>`
+      + rows,
+    op: { label: 'Save SLA', check: goLive ? () => 'Switch on SLA messages? From the next working morning, everyone gets emails about their due and late steps.' : null, run: () => saveSla(d), ok: 'SLA saved' } };
+};
+async function saveSla(d) {
+  const me = ME(); if (!me || me.role !== 'TL') throw E('Only the Team Leader can change the SLA.');
+  const cur = slaDaysNow(), days = {};
+  for (const s of SLA_STEPS) {
+    if (!s.def) continue;
+    days[s.k] = s.def.map((x, i) => {
+      const raw = d['s_' + s.k + '_' + i], v = String(raw == null ? cur[s.k][i] : raw).trim(), n = Number(v);
+      if (v === '' || !Number.isInteger(n) || n < 0 || n > SLA_MAX) throw E(`${s.label}: write a whole number of days from 0 to ${SLA_MAX}.`);
+      return n;
+    });
+  }
+  const live = d.slive === '1', now = Date.now(), old = (await api.get('settings', 'sla')) || {};
+  const doc = { live, since: +old.since || now, liveAt: live ? (old.live === true && +old.liveAt ? +old.liveAt : now) : 0, days, by: me.name, at: now };
+  await api.set('settings', 'sla', doc); setSla(doc);
+  const changed = SLA_STEPS.filter(s => s.def && JSON.stringify(days[s.k]) !== JSON.stringify(cur[s.k])).map(s => `${s.label} ${days[s.k].join('/')}`);
+  log({ t: 'SLA changed', qty: 0, note: [live !== !!old.live ? (live ? 'Messages on' : 'Report only') : '', ...changed].filter(Boolean).join(' · ') || 'Saved' });
+  return doc;
+}
+
+/* ---------- Reports → SLA ---------- */
+const SLA_PERIODS = [[7, '7 days'], [30, '30 days'], [90, '90 days']];
+function slaWho(j, x) {
+  if (x.who === 'TECH') return j.techName || 'Engineer';
+  if (x.who === 'TM') return 'Technical Manager';
+  const o = stepOwner(j); return (o && o.name) || `${ROLE[x.who]} · ${HUB_NAME[jobHub(j)] || jobHub(j)}`;
+}
+const slaDone = (jobs, since) => [].concat(...jobs.map(j => (Array.isArray(j.slaLog) ? j.slaLog : []).filter(e => +e.at >= since && slaStep(e.k)).map(e => Object.assign({ id: j.id }, e))));
+function slaOpen(now) { return JOBS.filter(j => isOpenStatus(j.status)).map(j => ({ j, x: slaOf(j, now) })).filter(o => o.x); }
+function repSla() {
+  const me = ME(), now = Date.now(), per = SLA_PERIODS.some(p => p[0] === UI.slaP) ? UI.slaP : 30;
+  const open = slaOpen(now), late = open.filter(o => slaIsLate(o.x)).sort((a, b) => b.x.late - a.x.late), dueT = open.filter(o => o.x.stage === 'due'), held = open.filter(o => o.x.stage === 'hold');
+  const asks = open.filter(o => o.x.hold && !o.x.hold.ok);
+  const done = slaDone(JOBS, now - per * DAY), ok = done.filter(e => !e.late).length, pct = n => n.n ? Math.round(n.ok / n.n * 100) + '%' : '–';
+  const mode = SLA_CFG.live ? `<b>Messages on</b>${SLA_CFG.liveAt ? ' since ' + fmtD(SLA_CFG.liveAt) : ''} · the people get reminders, breaches and escalations by email` : `<b>Report only</b>${SLA_CFG.since ? ' since ' + fmtD(SLA_CFG.since) : ''} · nobody is told yet${me.role === 'TL' ? '. Switch messages on in Database → SLA.' : '.'}`;
+  const row = o => `<div class="row${slaIsLate(o.x) ? ' is-late-row' : ''}"><span class="lead ${slaIsLate(o.x) ? 'bad' : o.x.stage === 'hold' ? '' : 'warn'}">${ic('clock', 'sm')}</span><button class="main rowbtn" data-a="sheet" data-s="job" data-id="${esc(o.j.id)}"><span class="t1">${esc(o.x.step.label)} ${o.x.stage === 'esc' ? '<span class="chip bad">Escalated</span>' : ''}</span><span class="t2">${esc(slaWho(o.j, o.x))} · ${tag(o.j.pn)} <span class="mono">${esc(o.j.id)}</span></span><span class="t3">${[slaIsLate(o.x) ? `<b class="bad-t">${lateDays(o.x.late)}</b> · due ${esc(slaDay(o.x.due))}` : o.x.stage === 'hold' ? 'On hold: ' + esc(o.x.hold.reason) : o.x.stage === 'due' ? 'Due today' : 'Due ' + esc(slaDay(o.x.due)), o.x.hold && !o.x.hold.ok ? `Hold asked by ${esc(o.x.hold.by)}: ${esc(o.x.hold.reason)}` : ''].filter(Boolean).join(' · ')}</span></button></div>`;
+  const group = (list, key, name) => { const m = new Map(); for (const e of list) { const k = key(e) || '(not recorded)'; const g = m.get(k) || { name: name(e, k), n: 0, ok: 0 }; g.n++; if (!e.late) g.ok++; m.set(k, g); } return [...m.values()]; };
+  const pctRow = g => `<tr><td>${esc(g.name)}</td><td class="num">${g.n}</td><td class="num">${g.n - g.ok || '–'}</td><td class="num">${g.n && g.ok / g.n < .8 ? `<b class="bad-t">${pct(g)}</b>` : pct(g)}</td></tr>`;
+  const bySt = SLA_STEPS.map(s => { const l = done.filter(e => e.k === s.k); return { name: s.label, n: l.length, ok: l.filter(e => !e.late).length }; }).filter(g => g.n);
+  const byPer = group(done, e => e.byId || e.by, e => e.by + (e.role ? ' · ' + e.role : '')).sort((a, b) => (b.n - b.ok) - (a.n - a.ok) || b.n - a.n);
+  const byHub = group(done, e => e.hub, (e, k) => HUB_NAME[k] || k).sort((a, b) => b.n - a.n);
+  const cols = ['', 'Done', 'Late', 'On time'];
+  return `<div class="card"><span class="hint">${mode}</span></div>
+    <div class="kpis">${kpi('Late now', late.length, late.length ? 'bad' : '')}${kpi('Due today', dueT.length)}${kpi('On hold', held.length)}${kpi(`On time · ${per} days`, pct({ n: done.length, ok }))}</div>
+    ${asks.length ? `<section class="blk"><div class="sec-h"><h2>Hold requests</h2></div><div class="list">${asks.map(row).join('')}</div></section>` : ''}
+    <section class="blk"><div class="sec-h"><h2>Late now</h2><span class="t3 muted">open requests</span></div>${late.length ? `<div class="list">${late.map(row).join('')}</div>` : '<p class="note">No step is late.</p>'}</section>
+    ${dueT.length || held.length ? `<section class="blk"><div class="sec-h"><h2>Due today and on hold</h2></div><div class="list">${dueT.concat(held).map(row).join('')}</div></section>` : ''}
+    <div class="filters" role="group" aria-label="Period">${SLA_PERIODS.map(([v, l]) => `<button class="${per === v ? 'on' : ''}" aria-pressed="${per === v}" data-a="slaP" data-v="${v}">${l}</button>`).join('')}</div>
+    <div class="card">${cardH('On time by step', allLoaded() ? `last ${per} days` : `last ${per} days · newest requests`)}${tbl(['Step', 'Done', 'Late', 'On time'], bySt.map(pctRow), 'No steps done in this period yet.')}</div>
+    <div class="card">${cardH('On time by person', `last ${per} days`)}${tbl(['Person'].concat(cols.slice(1)), byPer.map(pctRow), 'No steps done in this period yet.')}</div>
+    <div class="card">${cardH('On time by hub', `last ${per} days`)}${tbl(['Hub'].concat(cols.slice(1)), byHub.map(pctRow), 'No steps done in this period yet.')}</div>
+    <button class="btn sec block" data-a="slaxl">${ic('download', 'sm')}Download Excel · SLA</button>
+    <span class="hint">Working days, Monday to Friday, less the public holidays. A step done after its due day counts as late; a step on an approved hold counts as on time. Steps are recorded from the day the SLA update was published.</span>`;
+}
+/* the dashboard: one line with the SLA now */
+function slaDashCard() {
+  const now = Date.now(), open = slaOpen(now), late = open.filter(o => slaIsLate(o.x)).length, done = slaDone(JOBS, now - 30 * DAY), ok = done.filter(e => !e.late).length;
+  return `<div class="card dcard">${cardH('SLA', SLA_CFG.live ? 'messages on' : 'report only')}<div class="kpis">${kpi('Late now', late, late ? 'bad' : '')}${kpi('Due today', open.filter(o => o.x.stage === 'due').length)}${kpi('On hold', open.filter(o => o.x.stage === 'hold').length)}${kpi('On time · 30 days', done.length ? Math.round(ok / done.length * 100) + '%' : '–')}</div><button class="btn sm sec" data-a="goReport" data-v="sla">Open the SLA report</button></div>`;
+}
+const SLA_OPEN_HEAD = ['Request', 'Step', 'Who must act', 'Hub', 'Part number', 'Step started', 'Due day', 'Status', 'Working days late', 'Hold'];
+const SLA_DONE_HEAD = ['Request', 'Step', 'Done by', 'Role', 'Hub', 'Step started', 'Due day', 'Done', 'On time', 'Hold'];
+async function exportSla() {
+  const me = ME(); if (!me || !(['TL', 'MGR'].includes(me.role) || isWsLead(me))) return toast('Only the Team Leader or the Operations Manager can download the SLA report.', 'bad');
+  if (!DL) return toast('Excel download works in the published app.', 'bad');
+  if (exporting) return; exporting = true;
+  try {
+    toast('Preparing Excel…');
+    const jobs = await allJobs(), now = Date.now();
+    const st = x => x.stage === 'esc' ? 'Escalated' : x.stage === 'late' ? 'SLA breached' : x.stage === 'due' ? 'Due today' : x.stage === 'hold' ? 'On hold' : 'In time';
+    const open = jobs.filter(j => isOpenStatus(j.status)).map(j => ({ j, x: slaOf(j, now) })).filter(o => o.x).sort((a, b) => b.x.late - a.x.late || (a.x.due < b.x.due ? -1 : 1))
+      .map(({ j, x }) => [j.id, x.step.label, slaWho(j, x), HUB_NAME[slaHubOf(j)] || slaHubOf(j), j.pn || '', isoDT(x.start), x.due, st(x), x.late || '', x.hold ? `${x.hold.ok ? 'On hold' : 'Asked'}: ${x.hold.reason} (${x.hold.by})` : '']);
+    const done = slaDone(jobs, 0).sort((a, b) => b.at - a.at).map(e => [e.id, slaStep(e.k).label, e.by || '', e.role || '', HUB_NAME[e.hub] || e.hub || '', isoDT(e.from), e.due || '', isoDT(e.at), e.late ? 'No' : 'Yes', e.held ? 'Yes' : '']);
+    const d0 = new Date(), stamp = `${d0.getFullYear()}-${p2(d0.getMonth() + 1)}-${p2(d0.getDate())}`;
+    if (!window.XLSX) { try { await loadJs(XLSX_URL); } catch (e) { /* CSV fallback below */ } }
+    const X = window.XLSX;
+    if (!X) {
+      const q = x => { const t = String(x == null ? '' : x); return /[",\n]/.test(t) ? '"' + t.replace(/"/g, '""') + '"' : t; };
+      const fn = `SPMS-SLA-${stamp}.csv`;
+      return savedToast(await DL.save({ filename: fn, data: '﻿' + [SLA_DONE_HEAD, ...done].map(r => r.map(q).join(',')).join('\r\n') }), 'Excel library unavailable, saved ' + fn + ' (opens in Excel)');
+    }
+    const wb = X.utils.book_new();
+    X.utils.book_append_sheet(wb, xlSheet(X, SLA_OPEN_HEAD, open), 'Open steps');
+    X.utils.book_append_sheet(wb, xlSheet(X, SLA_DONE_HEAD, done), 'Steps done');
+    const filename = `SPMS-SLA-${stamp}.xlsx`;
+    savedToast(await DL.save({ filename, data: X.write(wb, { bookType: 'xlsx', type: 'array' }) }), 'Saved ' + filename);
+  } catch (e) { if (!(e && e.code === 'declined')) toast(e.message || 'Export failed', 'bad'); }
+  finally { exporting = false; }
+}
+REPORT_FN.sla = repSla;
 /* ==========================================================================
    Firebase build (Google AI Studio or any web host): passwords, built-in Team Leaders, staff accounts,
    change password, install as an app. Nothing here runs inside Claude.
@@ -7804,6 +8320,8 @@ const A = {
   async savePolicy() { try { await setPolicy($('#p-autoMaxValue').value, $('#p-autoMaxQty').value); await flushLog(); delete UI.drafts.autoMaxValue; delete UI.drafts.autoMaxQty; render(); toast('Auto-Rep limits saved'); } catch (e) { toast(e.message, 'bad'); } },
   excel() { exportExcel(); },
   ccxl() { exportCashCharge(); },
+  slaxl() { exportSla(); },
+  slaP(ds) { UI.slaP = +ds.v; const c = $('#live-rep'); if (c && UI.tab === 'rep') c.innerHTML = REPORT_FN[UI.report](); else render(); },
   impTemplate() { downloadTemplate(); },
   vanPick(ds) { const d = sd(); d.picks = (d.picks || []).concat([{ id: ds.id, qty: 1 }]); d.vq = ''; d._err = ''; renderSheet(); const q = $('#f-vq'); if (q) q.focus(); },
   vanUnpick(ds) { const d = sd(); d.picks = (d.picks || []).filter(p => p.id !== ds.id); renderSheet(); },
@@ -7870,6 +8388,68 @@ const dropZone = e => e.target && e.target.closest ? e.target.closest('.drop') :
 document.addEventListener('dragover', e => { const z = dropZone(e); if (z) { e.preventDefault(); z.classList.add('over'); } });
 document.addEventListener('dragleave', e => { const z = dropZone(e); if (z) z.classList.remove('over'); });
 document.addEventListener('drop', e => { const z = dropZone(e); if (!z) return; e.preventDefault(); z.classList.remove('over'); const f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0]; if (f) { if (UI.sheet && UI.sheet.name === 'accounts') readAccountsFile(f); else if (UI.sheet && UI.sheet.name === 'machines') readMachinesFile(f); else if (UI.sheet && UI.sheet.name === 'vanadd') readVanFile(f); else readImportFile(f); } });
+/* ---------- the phone's Back button (20 Nov 2026; Back on the home tab asks first, 21 Nov 2026) ----------
+   Back goes back in the page history. SPMS had none of its own, so in the Android app Back closed SPMS at once. Now each
+   open layer has one history entry: a tab other than the first (home) tab, a panel, a photo. Back closes the top one
+   (the photo, else the panel, else back to the first tab). Under them, once signed in, sits one more entry, the guard:
+   Back on the first tab with nothing open takes it and shows "Press Back again to close SPMS"; a second Back within
+   2 seconds closes SPMS (after 2 seconds, or a touch, the guard is back). Closing a layer on the screen (×, Close, Esc,
+   a tab) takes its entry away again (history.go).
+   Chrome's Back skips an entry when the page added the next one without a touch in between. So SPMS adds entries
+   (pushState) only right after a touch, and otherwise steps forward onto entries it already has (history.go): the guard
+   after the 2 seconds, or an entry Back skipped. Before the first touch there is no guard yet, so Back closes SPMS. */
+const BACK_AGAIN_MS = 2000;
+function onHomeTab() { const me = ME(), tabs = me && !UI.gate ? tabsFor(me) || [] : []; return !tabs.length || !tabs.some(t => t[0] === UI.tab) || UI.tab === tabs[0][0]; }
+const guardOn = () => !!ME() && !UI.gate && !UI.hAsked;
+function backDepth() {
+  let n = guardOn() ? 1 : 0;
+  if (!onHomeTab()) n++;
+  if (UI.sheet) n++;
+  if ($('#pv')) n++;
+  return n;
+}
+/* a new entry only right after a touch (transient user activation), else Chrome would skip the one below it on Back */
+const canPush = () => { const u = navigator.userActivation; return !u || !!u.isActive; };
+function hGo(n) {
+  const from = UI.hDepth || 0; UI.hDepth = from + n; UI.hBusy = true; history.go(n);
+  clearTimeout(UI.hBusyT); UI.hBusyT = setTimeout(() => { if (UI.hBusy) { UI.hBusy = false; UI.hDepth = from; UI.hTop = from; queueBack(); } }, 1000);   /* the entry was not there */
+}
+function backSync() {
+  UI.hQueued = false; if (UI.hBusy) return;
+  const want = backDepth(), have = UI.hDepth || 0, top = Math.max(UI.hTop || 0, have);
+  try {
+    if (want > have) {
+      if (top > have) { hGo(Math.min(want, top) - have); return; }   /* entries SPMS already has: step forward onto them */
+      if (!canPush()) return;
+      for (let i = have + 1; i <= want; i++) history.pushState({ spms: i }, '');
+      UI.hDepth = UI.hTop = want;
+    } else if (want < have) hGo(want - have);
+  } catch (e) { UI.hBusy = false; }
+}
+function queueBack() { if (!UI.hQueued) { UI.hQueued = true; setTimeout(backSync, 0); } }
+window.addEventListener('popstate', e => {
+  const at = (e.state && +e.state.spms) || 0;
+  if (UI.hBusy) { UI.hBusy = false; clearTimeout(UI.hBusyT); UI.hDepth = at; queueBack(); return; }   /* our own history.go has arrived */
+  UI.hDepth = at;
+  if (backDepth() > at) {   /* the user pressed Back: close the top layer */
+    if ($('#pv')) photoClose();
+    else if (UI.sheet) closeSheet();
+    else if (!onHomeTab()) { const tabs = tabsFor(ME()) || []; UI.tab = tabs[0][0]; render(); const s = $('#scr'); if (s) s.scrollTop = 0; }
+    else if (guardOn()) {   /* only the guard was left: Back on the home tab asks first */
+      UI.hAsked = true; toast('Press Back again to close SPMS');
+      clearTimeout(UI.hAskT); UI.hAskT = setTimeout(() => { UI.hAsked = false; const t = $('#toast'); if (t && /Press Back again/.test(t.textContent)) t.classList.remove('show'); queueBack(); }, BACK_AGAIN_MS);
+    }
+  }
+  queueBack();
+});
+/* a touch (or a key) puts the guard back at once and lets SPMS add the entries it needs */
+['pointerup', 'click', 'keydown'].forEach(t => document.addEventListener(t, e => {
+  if (t === 'keydown' && (e.key === 'Escape' || e.key === 'Tab')) return;
+  if (UI.hAsked) { UI.hAsked = false; clearTimeout(UI.hAskT); }
+  queueBack();
+}, true));
+/* opened again on an entry SPMS had added before (a reload): count from here */
+try { if (history.state && history.state.spms) history.replaceState(null, ''); } catch (e) { /* no history */ }
 const FOCUSABLE = 'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
 document.addEventListener('keydown', e => {
   if (e.key === 'Escape' && $('#pv')) { e.preventDefault(); photoClose(); return; }
